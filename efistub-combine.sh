@@ -25,13 +25,13 @@ while getopts 'e:k:i:c:o:v?' opt; do
     i) INITRAMFS+=("$OPTARG") ;;
     c) CMDLINE="$OPTARG" ;;
     o) OUTPUT="$OPTARG" ;;
-    v) VERBOSE=true ;;
+    v) ((VERBOSE++)) ;;
     *) usage ;;
   esac
 done
 
 # print parsed values if verbose
-if [[ $VERBOSE == true ]]; then
+if [[ $VERBOSE -ge 2 ]]; then
   printf 'EFISTUB   : %s\n' "$EFISTUB"
   printf 'KERNEL    : %s\n' "$KERNEL"
   printf 'INITRAMFS :\n'
