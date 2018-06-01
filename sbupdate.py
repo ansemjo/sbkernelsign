@@ -3,6 +3,7 @@
 import subprocess
 import configparser
 import argparse
+import shutil
 import sys
 import os
 
@@ -14,6 +15,8 @@ NAME, BOOT, EFISTUB = 'name', 'boot', 'efistub'
 KEY, CERT, KERNEL = 'key', 'crt', 'kernel'
 INITRAMFS, CMDLINE = 'initramfs', 'cmdline'
 OUTPUT = 'output'
+
+OBJCOPY_SCRIPT = '/home/ansemjo/script/sbupdate-py/efistub-combine.sh'
 
 # todo: accept commandline parameter
 with open('secureboot.ini') as ini:
@@ -27,9 +30,10 @@ for s in config.sections():
     config.set(s, NAME, s)
 
   # debugging output
-  print(f'[{s}]')
-  for i in config.items(s): print(i)
-  print()
+  if False:
+    print(f'[{s}]')
+    for i in config.items(s): print(i)
+    print()
 
   # check if everything that is required is present
   for r in [EFISTUB, KEY, CERT, KERNEL, INITRAMFS, CMDLINE, OUTPUT]:
@@ -38,8 +42,7 @@ for s in config.sections():
 
 # combine efistub, kernel and initramfs into a single binary
 def objcopy (efistub, kernel, initramfs, cmdline, output):
-  script = '/home/ansemjo/script/sbupdate-py/efistub-combine.sh'
-  cmd = [script, '-e', efistub, '-k', kernel, '-c', cmdline, '-o', output]
+  cmd = [OBJCOPY_SCRIPT, '-v', '-e', efistub, '-k', kernel, '-c', cmdline, '-o', output]
   for image in initramfs:
     cmd.extend(['-i', image])
   return subprocess.run(cmd, check=True)
@@ -50,22 +53,26 @@ def sbsign (key, cert, binary):
   return subprocess.run(cmd, check=True)
 
 # let's go
-for section in config.sections():
+for cfg in [config[s] for s in config.sections()]:
 
-  cfg = config[section]
-
+  # fetch values
+  efistub, cmdline, output = cfg[EFISTUB], cfg[CMDLINE], cfg[OUTPUT]
+  kernel, key, cert = cfg[KERNEL], cfg[KEY], cfg[CERT]
   # parse initramfs list
   initramfs = cfg[INITRAMFS].strip().splitlines()
 
   # if a 'boot' config option exists, join paths
   if BOOT in cfg:
-    boot = cfg[BOOT]
-    cfg[KERNEL] = os.path.join(boot, cfg[KERNEL])
-    initramfs = [os.path.join(boot, image) for image in initramfs]
+    kernel = os.path.join(cfg[BOOT], kernel)
+    initramfs = [os.path.join(cfg[BOOT], image) for image in initramfs]
 
   # print info about this binary
-  print((cfg[EFISTUB], cfg[KERNEL], initramfs, cfg[CMDLINE], cfg[OUTPUT]))
+  print((efistub, kernel, initramfs, cmdline, output))
+
+  # create backup copy
+  if os.path.isfile(output):
+    shutil.copy2(output, output+'.bak')
 
   # assemble and sign binary
-  objcopy(cfg[EFISTUB], cfg[KERNEL], initramfs, cfg[CMDLINE], cfg[OUTPUT])
-  sbsign(cfg[KEY], cfg[CERT], cfg[OUTPUT])
+  objcopy(efistub, kernel, initramfs, cmdline, output)
+  sbsign(key, cert, output)
