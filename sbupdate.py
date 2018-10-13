@@ -6,9 +6,7 @@ import subprocess
 import logging
 
 # initialize logging
-logging.basicConfig(format="%(levelname).4s: [%(name)s] %(message)s", level=logging.DEBUG)
-log = logging.getLogger("sbkernelsign")
-logger = logging.getLogger
+logger = lambda s: logging.getLogger(s)
 
 # configuration variable names
 GLOBAL = "global"
@@ -73,7 +71,7 @@ def get_kernels(config, kernelglob=None):
 
     # error when no kernels are found / left
     if len(kernels) == 0:
-        log.error("no kernels configured")
+        logger('*').error("no kernels configured")
         exit(1)
 
     return kernels
@@ -114,7 +112,7 @@ def do_sign_kernel(name, combine, efistub, kernel, initramfs, cmdline, key, cert
         if os.path.isfile(output):
             backup = output + backup
             shutil.copy2(output, backup)
-            log.info(f"backed up old kernel to {backup}")
+            log.debug(f"backed up old kernel to {backup}")
 
     # assemble and sign kernel binary
     objcopy(combine, efistub, kernel, initramfs, cmdline, output)
@@ -126,16 +124,18 @@ def do_sign_kernel(name, combine, efistub, kernel, initramfs, cmdline, key, cert
 class SbKernelSign(object):
     def __init__(self):
         from argparse import ArgumentParser, FileType
-        parser = ArgumentParser(description="bundle and sign kernels for secureboot systems")
-        commands = parser.add_subparsers(required=True, dest='command')
+        parser = ArgumentParser(description="Bundle and sign kernels for secureboot systems.")
+        commands = parser.add_subparsers(required=True, metavar='command', help='mode of operation')
 
-        auto = commands.add_parser("auto")
+        auto = commands.add_parser("auto", help='automatic, from configuration file')
         auto.add_argument(
             "-c", dest="config", help="configuration file", type=FileType("r"), default="secureboot.ini"
         )
+        auto.add_argument('--no-glob', help='do not automatically add kernels', action='store_true')
+        auto.add_argument('--logging', help='set logging level', choices=['INFO', 'DEBUG', 'WARN'])
         auto.set_defaults(func=self.auto)
 
-        manual = commands.add_parser("manual")
+        manual = commands.add_parser("manual", help='manual, all args provided')
         manual.add_argument('-s', dest='script', help='efistub-combine script', required=True)
         manual.add_argument('-e', dest='efistub', help='systemd-boot efistub', required=True)
         manual.add_argument('-k', dest='kernel', help='kernel binary', required=True)
@@ -144,16 +144,20 @@ class SbKernelSign(object):
         manual.add_argument('-o', dest='output', help='signed kernel output', required=True)
         manual.add_argument('--key', help='signing key', required=True)
         manual.add_argument('--cert', help='signing certificate', required=True)
-        manual.add_argument('-b', dest='backup', help='backup suffix')        
+        manual.add_argument('-b', dest='backup', help='backup suffix')
+        manual.add_argument('--logging', help='set logging level', choices=['INFO', 'DEBUG', 'WARN'])
         manual.set_defaults(func=self.manual)
 
         args = parser.parse_args()
+        loglevel = getattr(logging, args.logging or 'INFO')
+        logging.basicConfig(format="%(levelname)s: [%(name)s] %(message)s", level=loglevel)
         args.func(args)
 
     def auto(self, args):
+
         config = get_config(args.config)
         kg = config.get(GLOBAL, "kernels", fallback="/boot/vmlinuz-*")
-        kernels = get_kernels(config, kg)
+        kernels = get_kernels(config, None if args.no_glob else kg)
         for k in kernels:
 
             do_sign_kernel(
