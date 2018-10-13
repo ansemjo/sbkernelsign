@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 
-import subprocess
-import configparser
-import argparse
-import shutil
-import glob
 import sys
 import os
-import re
+import subprocess
+import logging
 
-# .ini config parser with ${var} interpolation
-config = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
-
-# ignore whitespace around section header
-config.SECTCRE = re.compile(r"\[ *(?P<header>[^]]+?) *\]")
+# initialize logging
+logging.basicConfig(format="%(levelname).4s: [%(name)s] %(message)s", level=logging.DEBUG)
+log = logging.getLogger("sbkernelsign")
+logger = logging.getLogger
 
 # configuration variable names
 GLOBAL = "global"
@@ -28,49 +23,49 @@ INITRAMFS = "initramfs"
 CMDLINE = "cmdline"
 OUTPUT = "output"
 
-# TODO: commandline parser
-with open("secureboot.ini") as ini:
-    config.read_file(ini)
+# initialize config parser with ${var} interpolation and loose section headers
+def get_config(inifile):
+    from configparser import ConfigParser, ExtendedInterpolation
+    import re
 
-
-def err(e, exit=True, prefix="ERR"):
-    print(prefix + ":", e, file=sys.stderr)
-    if exit:
-        sys.exit(1)
+    cp = ConfigParser(interpolation=ExtendedInterpolation())
+    cp.SECTCRE = re.compile(r"\[ *(?P<header>[^]]+?) *\]")
+    cp.read_file(inifile)
+    return cp
 
 
 # check config sections for possible kernels
 def get_kernels(config, kernelglob=None):
+    import glob
 
     # add missing sections by globbing
     if kernelglob is not None:
         for kernel in (k[len(kg) - 1 :] for k in glob.iglob(kernelglob)):
             if not config.has_section(kernel):
                 config.add_section(kernel)
+                logger(kernel).debug("added automatically")
 
     kernels = []
     for s in [s for s in config.sections() if s != GLOBAL]:
         section = config[s]
+        log = logger(s)
 
         # skip when IGNORE is truthy
         if IGNORE in section and section.getboolean(IGNORE):
+            log.debug("ignored")
             continue
 
         # add name from section name by default
         if not NAME in section:
             section[NAME] = s.strip()
 
-        # exception for missing config items
-        class MissingConf(Exception):
-            pass
-
         # check if everything that is required is present, otherwise ignore
         try:
             for r in [EFISTUB, KEY, CERT, KERNEL, INITRAMFS, CMDLINE, OUTPUT]:
                 if not r in section:
-                    err(f"[{s}]: required option '{r}' missing", exit=False, prefix="WARN")
-                    raise MissingConf()
-        except MissingConf:
+                    log.warning(f"ignored due to missing option '{r}'")
+                    raise ValueError()
+        except ValueError:
             continue
 
         # all checks passed, append to list
@@ -78,17 +73,15 @@ def get_kernels(config, kernelglob=None):
 
     # error when no kernels are found / left
     if len(kernels) == 0:
-        err("no kernels configured")
+        log.error("no kernels configured")
+        sys.exit(1)
 
     return kernels
 
 
-kg = config.get(GLOBAL, "kernels", fallback="/boot/vmlinuz-*")
-kernels = get_kernels(config, kg)
-
 # combine efistub, kernel and initramfs into a single binary
-def objcopy(efistub, kernel, initramfs, cmdline, output):
-    cmd = [config.get(GLOBAL, SCRIPT), "-v", "-e", efistub, "-k", kernel, "-c", cmdline, "-o", output]
+def objcopy(script, efistub, kernel, initramfs, cmdline, output):
+    cmd = [script, "-v", "-e", efistub, "-k", kernel, "-c", cmdline, "-o", output]
     for image in initramfs:
         cmd.extend(["-i", image])
     return subprocess.run(cmd, check=True)
@@ -100,36 +93,56 @@ def sbsign(key, cert, binary):
     return subprocess.run(cmd, check=True)
 
 
-def do_sign_kernel(name, efistub, kernel, initramfs, cmdline, key, cert, output, verbose=True, backup=".bak"):
+def do_sign_kernel(name, efistub, kernel, initramfs, cmdline, key, cert, output, backup=".bak"):
+    log = logger(name)
 
     # print info about this kernel
-    if verbose:
-        for i in ("", f"\033[1m[ {name} ]\033[0m", kernel, initramfs, output, ""):
-            print(i)
+    log.info("processing kernel")
+    for m in (
+        f"efistub: {efistub}",
+        f"kernel: {kernel}",
+        f"initramfs: {initramfs}",
+        f"cmdline: {cmdline}",
+        f"output: {output}",
+    ):
+        log.debug(m)
 
     # create backup copy
     if backup is not None:
+        import shutil
+
         if os.path.isfile(output):
-            shutil.copy2(output, output + backup)
+            backup = output + backup
+            shutil.copy2(output, backup)
+            log.info(f"backed up old kernel to {backup}")
 
     # assemble and sign kernel binary
-    objcopy(efistub, kernel, initramfs, cmdline, output)
+    script = config.get(GLOBAL, SCRIPT)
+    objcopy(script, efistub, kernel, initramfs, cmdline, output)
     sbsign(key, cert, output)
 
 
-# let's go
-for k in kernels:
+# ------- let's go -------
+if __name__ == "__main__":
+    import argparse
 
-    do_sign_kernel(
-        k[NAME],
-        k[EFISTUB],
-        k[KERNEL],
-        k[INITRAMFS].strip().splitlines(),
-        k[CMDLINE],
-        k[KEY],
-        k[CERT],
-        k[OUTPUT],
-        verbose=True,
-        backup=".bak",
-    )
+    # TODO: commandline parser
+    with open("secureboot.ini") as ini:
+        config = get_config(ini)
+
+    kg = config.get(GLOBAL, "kernels", fallback="/boot/vmlinuz-*")
+    kernels = get_kernels(config, kg)
+    for k in kernels:
+
+        do_sign_kernel(
+            k[NAME],
+            k[EFISTUB],
+            k[KERNEL],
+            k[INITRAMFS].strip().splitlines(),
+            k[CMDLINE],
+            k[KEY],
+            k[CERT],
+            k[OUTPUT],
+            backup=".bak",
+        )
 
