@@ -17,10 +17,11 @@ sectdict = lambda s: dict(s.items())
 # configuration element
 class Configuration(object):
 
+    DEFAULT_CONFIGURATION = "/etc/sbkernelsign.cfg"
     DEFAULT_EFISTUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
     DEFAULT_COMBINE = "/usr/bin/efistub-combine"
-    DEFAULT_KEY = "/etc/efikeys/DB.key"
-    DEFAULT_CERT = "/etc/efikeys/DB.crt"
+    DEFAULT_KEY = "/etc/efikeys/DatabaseKey.key"
+    DEFAULT_CERT = "/etc/efikeys/DatabaseKey.crt"
 
     # initialize config parser with ${var} interpolation and loose section headers
     def __init__(self, file):
@@ -158,7 +159,7 @@ class Commandline(object):
 
         parser = ArgumentParser(description="Bundle and sign kernels for secureboot systems.")
         commands = parser.add_subparsers(required=True, metavar="command", help="mode of operation")
-        defaults = {"config": "secureboot.ini", "logging": "INFO", "no_glob": False}
+        defaults = {"config": Configuration.DEFAULT_CONFIGURATION, "logging": "INFO", "no_glob": False}
 
         # --- automatic mode ---
         auto = commands.add_parser("auto", help="automatic, from configuration file")
