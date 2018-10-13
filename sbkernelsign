@@ -16,6 +16,12 @@ sectdict = lambda s: dict(s.items())
 
 # configuration element
 class Configuration(object):
+
+    DEFAULT_EFISTUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+    DEFAULT_COMBINE = "/usr/bin/efistub-combine"
+    DEFAULT_KEY = "/etc/efikeys/DB.key"
+    DEFAULT_CERT = "/etc/efikeys/DB.crt"
+
     # initialize config parser with ${var} interpolation and loose section headers
     def __init__(self, file):
 
@@ -23,12 +29,14 @@ class Configuration(object):
         self.cfg.SECTCRE = compile(r"\[ *(?P<header>[^]]+?) *\]")
         self.cfg.read_file(file)
 
-        
         self.kernelg = self.cfg.get(self.GLOBAL, "kernelglob", fallback="/boot/vmlinuz-*")
         self.kernelr = compile(self.cfg.get(self.GLOBAL, "kernelrexp", fallback="/?boot/vmlinuz-([^/]+)$"))
-        self.efistub = self.cfg.get(self.GLOBAL, "efistub", fallback="/usr/lib/systemd/boot/efi/linuxx64.efi.stub")
-        self.key = self.cfg.get(self.GLOBAL, "key", fallback="/etc/efikeys/DB.key")
-        self.cert = self.cfg.get(self.GLOBAL, "cert", fallback="/etc/efikeys/DB.crt")
+        
+        self.efistub = self.cfg.get(self.GLOBAL, "efistub", fallback=self.DEFAULT_EFISTUB)
+        Run.script = self.cfg.get(self.GLOBAL, "combine", fallback=self.DEFAULT_COMBINE)
+        
+        self.key = self.cfg.get(self.GLOBAL, "key", fallback=self.DEFAULT_KEY)
+        self.cert = self.cfg.get(self.GLOBAL, "cert", fallback=self.DEFAULT_CERT)
 
     # return globals as dict
     GLOBAL = "global"
@@ -82,11 +90,13 @@ class Configuration(object):
 # things that call external binaries or scripts
 class Run(object):
 
+    # script for objcopy, should be set before use
+    script = None
+
     # combine efistub, kernel and initramfs into a single binary
     @staticmethod
     def objcopy(efistub, kernel, initramfs, cmdline, output):
-        script = "./efistub-combine.sh"
-        cmd = [script, "-v", "-e", efistub, "-k", kernel, "-c", cmdline, "-o", output]
+        cmd = [Run.script, "-v", "-e", efistub, "-k", kernel, "-c", cmdline, "-o", output]
         for image in initramfs:
             cmd.extend(["-i", image])
         return subprocess.run(cmd, check=True)
@@ -165,72 +175,75 @@ class Commandline(object):
 
         # --- manual mode ---
         manual = commands.add_parser("manual", help="manual, all args provided")
-        manual.add_argument("-s", dest="script", help="efistub-combine script", required=True)
-        manual.add_argument("-e", dest="efistub", help="systemd-boot efistub", required=True)
         manual.add_argument("-k", dest="kernel", help="kernel binary", required=True)
-        manual.add_argument("-i", dest="initramfs", help="initramfs list", nargs="+", metavar="IMG")
+        manual.add_argument("-i", dest="initramfs", help="initramfs list", nargs="+", metavar="IMG", required=True)
         manual.add_argument("-c", dest="cmdline", help="kernel cmdline", required=True)
         manual.add_argument("-o", dest="output", help="signed kernel output", required=True)
-        manual.add_argument("--key", help="signing key", required=True)
-        manual.add_argument("--cert", help="signing certificate", required=True)
-        manual.add_argument("-b", dest="backup", help="backup suffix")
+        manual.add_argument("-K", dest="key", help="signing key")
+        manual.add_argument("-C", dest="cert", help="signing certificate")
+        manual.add_argument("-e", dest="efistub", help="systemd-boot efistub")
+        manual.add_argument("-s", dest="script", help="efistub-combine script")
         manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
-        manual.set_defaults(**defaults, func=self.manual)
+        manual.set_defaults(**defaults, func=self.manual, **{
+            'key': Configuration.DEFAULT_KEY, 'cert': Configuration.DEFAULT_CERT,
+            'efistub': Configuration.DEFAULT_EFISTUB, 'script': Configuration.DEFAULT_COMBINE,
+            'name': 'manual',
+        })
 
         args = parser.parse_args()
         loglevel = getattr(logging, args.logging or "INFO")
-        logging.basicConfig(
-            format="\033[1m%(levelname)s \033[32m[%(name)s]\033[0m %(message)s", level=loglevel
-        )
+        logging.basicConfig(format="\033[1m%(levelname)s \033[32m[%(name)s]\033[0m %(message)s", level=loglevel)
         args.func(args)
 
+    # automatic mode
     def auto(self, args):
 
+        # open configuration, add globbing
         conf = Configuration(args.config)
         if not args.no_glob:
             conf.addglob()
 
-        for k in conf.kernels():
-            k.print().backup(".bak").sign()
+        # combine and sign kernels
+        self.signall(conf.kernels())
 
+    # hook mode for pacman
     def hook(self, args):
 
+        # open configuration
         conf = Configuration(args.config)
 
+        # parse targets on stdin
         targets, force = [], False
         for line in (line.strip() for _, line in enumerate(sys.stdin)):
             match = conf.kernelr.match(line)
             if match is None:
                 force = True
                 continue
+            # add matches to list of targets
             name = match.expand(r"\1")
             conf.addsection(name)
             targets.append(name)
 
+        # if any target did not match kernel regexp, force auto rebuild
         if force:
             logger('*').info('forced rebuild')
             conf.addglob()
             targets = None
 
-        for k in conf.kernels(targets):
-            k.print().backup(".bak").sign()
+        # combine and sign kernels
+        self.signall(conf.kernels(targets))
 
+    # fully manual mode
     def manual(self, args):
-        # print(dict(k.items()))
-        #     Kernel.all_in_one(combine, ".bak", **dict(k.items()))
-        # do_sign_kernel(
-        #     "manual",
-        #     args.script,
-        #     args.efistub,
-        #     args.kernel,
-        #     args.initramfs,
-        #     args.cmdline,
-        #     args.key,
-        #     args.cert,
-        #     args.output,
-        #     backup=args.backup,
-        # )
-        pass
+        
+        Run.script = args.script
+        kernel = Kernel(**(args.__dict__))
+        self.signall([kernel])
+
+    # helper to perform combine and sign
+    def signall(self, kernels, backup='.bak'):
+        for k in kernels:
+            k.print().backup(backup).sign()
 
 
 # ------- let's go -------
