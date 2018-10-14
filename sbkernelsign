@@ -8,6 +8,9 @@
 # enabled SecureBoot. The DatabaseKey.key must be enrolled in your
 # firmware for this to work.
 
+# TODO: handle kernel deletion by deleting signed binary?
+# TODO: add 'sign' command to sign single extra binaries
+
 import sys
 import os
 from configparser import ConfigParser, ExtendedInterpolation, DuplicateSectionError
