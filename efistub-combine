@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 
 # Copyright (c) 2018 Anton Semjonov
+# Licensed under the MIT LICENSE
 
 # combine the efistub from systemd-boot with a kernel,
 # (multiple) initramfs and a kernel commandline. this

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# Copyright (c) 2018 Anton Semjonov
+# Licensed under the MIT License
+
+# Script to automate the bundling and signing of EFISTUB compatible
+# kernels into a single singed binary for usage on systems with
+# enabled SecureBoot. The DatabaseKey.key must be enrolled in your
+# firmware for this to work.
+
 import sys
 import os
 from configparser import ConfigParser, ExtendedInterpolation, DuplicateSectionError
@@ -32,17 +40,18 @@ class Configuration(object):
 
         self.kernelg = self.cfg.get(self.GLOBAL, "kernelglob", fallback="/boot/vmlinuz-*")
         self.kernelr = compile(self.cfg.get(self.GLOBAL, "kernelrexp", fallback="/?boot/vmlinuz-([^/]+)$"))
-        
+
         self.efistub = self.cfg.get(self.GLOBAL, "efistub", fallback=self.DEFAULT_EFISTUB)
         Run.script = self.cfg.get(self.GLOBAL, "combine", fallback=self.DEFAULT_COMBINE)
-        
+
         self.key = self.cfg.get(self.GLOBAL, "key", fallback=self.DEFAULT_KEY)
         self.cert = self.cfg.get(self.GLOBAL, "cert", fallback=self.DEFAULT_CERT)
 
     # return globals as dict
     GLOBAL = "global"
+
     def globals(self):
-        return {'efistub': self.efistub, 'key': self.key, 'cert': self.cert}
+        return {"efistub": self.efistub, "key": self.key, "cert": self.cert}
 
     # add sections by globbing for kernels on filesystem
     def addglob(self):
@@ -59,10 +68,10 @@ class Configuration(object):
         return self.cfg[name]
 
     def kernels(self, targets=None):
-        
+
         kernels = []
         sections = (s for s in (self.cfg.sections() if targets is None else targets) if s != self.GLOBAL)
-        
+
         for name in sections:
             section = self.addsection(name)
             log = logger(name)
@@ -124,11 +133,11 @@ class Kernel(object):
 
         # skip removed kernels
         if not os.path.isfile(self.kernel):
-            raise TypeError('kernel removed')
+            raise TypeError("kernel removed")
         # all other files should exist
         for f in [self.efistub] + self.initramfs + [self.key, self.cert]:
             if not os.path.isfile(f):
-                raise FileNotFoundError(self.name + ': ' + f)
+                raise FileNotFoundError(self.name + ": " + f)
 
     def print(self):
         # print info about this kernel
@@ -177,7 +186,9 @@ class Commandline(object):
         # --- manual mode ---
         manual = commands.add_parser("manual", help="manual, all args provided")
         manual.add_argument("-k", dest="kernel", help="kernel binary", required=True)
-        manual.add_argument("-i", dest="initramfs", help="initramfs list", nargs="+", metavar="IMG", required=True)
+        manual.add_argument(
+            "-i", dest="initramfs", help="initramfs list", nargs="+", metavar="IMG", required=True
+        )
         manual.add_argument("-c", dest="cmdline", help="kernel cmdline", required=True)
         manual.add_argument("-o", dest="output", help="signed kernel output", required=True)
         manual.add_argument("-K", dest="key", help="signing key")
@@ -185,15 +196,23 @@ class Commandline(object):
         manual.add_argument("-e", dest="efistub", help="systemd-boot efistub")
         manual.add_argument("-s", dest="script", help="efistub-combine script")
         manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
-        manual.set_defaults(**defaults, func=self.manual, **{
-            'key': Configuration.DEFAULT_KEY, 'cert': Configuration.DEFAULT_CERT,
-            'efistub': Configuration.DEFAULT_EFISTUB, 'script': Configuration.DEFAULT_COMBINE,
-            'name': 'manual',
-        })
+        manual.set_defaults(
+            **defaults,
+            func=self.manual,
+            **{
+                "key": Configuration.DEFAULT_KEY,
+                "cert": Configuration.DEFAULT_CERT,
+                "efistub": Configuration.DEFAULT_EFISTUB,
+                "script": Configuration.DEFAULT_COMBINE,
+                "name": "manual",
+            },
+        )
 
         args = parser.parse_args()
         loglevel = getattr(logging, args.logging or "INFO")
-        logging.basicConfig(format="\033[1m%(levelname)s \033[32m[%(name)s]\033[0m %(message)s", level=loglevel)
+        logging.basicConfig(
+            format="\033[1m%(levelname)s \033[32m[%(name)s]\033[0m %(message)s", level=loglevel
+        )
         args.func(args)
 
     # automatic mode
@@ -227,7 +246,7 @@ class Commandline(object):
 
         # if any target did not match kernel regexp, force auto rebuild
         if force:
-            logger('*').info('forced rebuild')
+            logger("*").info("forced rebuild")
             conf.addglob()
             targets = None
 
@@ -236,13 +255,13 @@ class Commandline(object):
 
     # fully manual mode
     def manual(self, args):
-        
+
         Run.script = args.script
         kernel = Kernel(**(args.__dict__))
         self.signall([kernel])
 
     # helper to perform combine and sign
-    def signall(self, kernels, backup='.bak'):
+    def signall(self, kernels, backup=".bak"):
         for k in kernels:
             k.print().backup(backup).sign()
 
