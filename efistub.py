@@ -2,8 +2,9 @@
 # minimum version: 3.5
 
 import subprocess
-import magic
-import distro
+import threading
+import magic  #< req
+import distro #< req
 import re
 import os
 
@@ -18,9 +19,22 @@ initramfs_r, initramfs_w = os.pipe()
 initramfs_w = os.fdopen(initramfs_w)
 iniramfs_cat = subprocess.Popen(['cat'] + INITRAMFS, stdout=initramfs_w)
 
-# open cmdline and dynamic osrelease pipes
+# write cmdline through pipe
 cmdline_r, cmdline_w = os.pipe()
+def pipe_cmdline():
+  os.write(cmdline_w, CMDLINE.encode())
+  os.close(cmdline_w)
+cmdline_t = threading.Thread(target=pipe_cmdline)
+cmdline_t.start()
+
+# write dynamic osrelease info through pipe
 osrel_r, osrel_w = os.pipe()
+def pipe_osrelease():
+  kernelver = re.sub(r'.*version ([^ ,]+).*', r'\1', magic.from_file(KERNEL))
+  os.write(osrel_w, f'NAME="{distro.name()}"\nID="{os.path.basename(KERNEL)}"\nVERSION_ID="{kernelver}"\n'.encode())
+  os.close(osrel_w)
+osrel_t = threading.Thread(target=pipe_osrelease)
+osrel_t.start()
 
 # combine with objcopy
 objcopy = subprocess.Popen([
@@ -36,19 +50,13 @@ objcopy = subprocess.Popen([
   EFISTUB, '/tmp/combined.efi',
   ], pass_fds=[osrel_r, cmdline_r, initramfs_r])
 
-# write dynamic osrelease info
-kernelver = re.sub(r'.*version ([^ ,]+).*', r'\1', magic.from_file(KERNEL))
-os.write(osrel_w, f'NAME="{distro.name()}"\nID="{os.path.basename(KERNEL)}"\nVERSION_ID="{kernelver}"\n'.encode())
-os.close(osrel_w)
-
-# write to cmdline pipe
-os.write(cmdline_w, CMDLINE.encode())
-os.close(cmdline_w)
-
 # wait for processes and close pipes
 # TODO: add timeout to wait and try:except to detect if objcopy crashes
-print('wait for initramfs-cat')
+#print('join threads')
+cmdline_t.join()
+osrel_t.join()
+#print('wait for initramfs-cat')
 iniramfs_cat.wait()
 initramfs_w.close()
-print('wait for objcopy')
+#print('wait for objcopy')
 objcopy.wait()
