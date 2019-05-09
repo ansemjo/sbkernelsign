@@ -9,10 +9,15 @@ import distro  # < req
 import re
 import os
 
+import struct
+import shutil
+import tempfile
+
 # parse version from kernel directly, k: file-object of opened kernel
 # https://github.com/file/file/blob/31a82018c2ed153b84ea5e115fa855de24eb46d1/magic/Magdir/linux#L109
 def parse_kernel_version(k):
-  import struct
+  # save seek to restore later
+  s = k.tell()
 
   # check 'magic' bytes
   if not k.seek(514) or not k.read(4) == b"HdrS":
@@ -23,8 +28,10 @@ def parse_kernel_version(k):
   offset = struct.unpack('<h', k.read(2))[0]
   k.seek(offset + 512)
 
-  # read and split kernel version
-  return k.read(256).split(b' ', 1)[0].decode()
+  # read and split kernel version, restore seek
+  v = k.read(256).split(b' ', 1)[0].decode()
+  k.seek(s)
+  return v
 
 # parse /etc/os-release if it exists and return either PRETTY_NAME, NAME or 'Linux'
 def get_distro_name():
@@ -37,61 +44,78 @@ def get_distro_name():
   finally:
     return osdict.get('PRETTY_NAME', osdict.get('NAME', 'Linux'))
 
+# generate a new os-release dynamically for embedding with efistub
+# https://github.com/systemd/systemd/blob/72830b187f5aa06b3e89ca121bbc35451764f1bc/docs/BOOT_LOADER_SPECIFICATION.md#type-2-efi-unified-kernel-images
+def generate_osrel(kernel):
+  t = tempfile.SpooledTemporaryFile(mode='wt+')
+  print('NAME="%s"' % get_distro_name(), file=t)
+  print('ID="%s"' % os.path.basename(kernel.name), file=t)
+  print('VERSION_ID="%s"' % parse_kernel_version(kernel), file=t)
+  t.seek(0)
+  return t
+
+# concatenate multiple files to tempfile
+def combine_files(flist):
+  t = tempfile.SpooledTemporaryFile()
+  for f in flist:
+    shutil.copyfileobj(f, t)
+    f.close()
+  t.seek(0)
+  return t
+
+# write a string to tempfile
+def string_to_tempfile(s):
+  t = tempfile.SpooledTemporaryFile(mode='wt+')
+  print(s, file=t)
+  t.seek(0)
+  return t
+
 def efistub_combine(efistub, kernel, initramfs, cmdline, output):
 
-  # concatenate initramfs in pipe
-  initramfs_r, initramfs_w = os.pipe()
-  initramfs_w = os.fdopen(initramfs_w)
-  iniramfs_p = subprocess.Popen(["cat"] + initramfs, stdout=initramfs_w)
+  # write cmdline to tempfile
+  cmdline = string_to_tempfile(cmdline)
 
-  # write cmdline through pipe
-  cmdline_r, cmdline_w = os.pipe()
-  def pipe_cmdline():
-    os.write(cmdline_w, cmdline.encode())
-    os.close(cmdline_w)
-  cmdline_t = threading.Thread(target=pipe_cmdline)
-  cmdline_t.start()
+  # generate an os-release for embedding
+  osrel = generate_osrel(kernel)
 
-  # write dynamic osrelease info through pipe
-  osrel_r, osrel_w = os.pipe()
-  def pipe_osrelease():
-    kernelver = re.sub(r".*version ([^ ,]+).*", r"\1", magic.from_file(kernel))
-    os.write(osrel_w, f'NAME="{distro.name()}"\n'.encode())
-    os.write(osrel_w, f'ID="{os.path.basename(kernel)}"\n'.encode())
-    os.write(osrel_w, f'VERSION_ID="{kernelver}"\n'.encode())
-    os.close(osrel_w)
-  osrel_t = threading.Thread(target=pipe_osrelease)
-  osrel_t.start()
+  # concatenate initramfs in memory
+  initrd = combine_files(initramfs)
+
+  # dict with all the file descriptors
+  fds = {
+    'efistub': efistub.fileno(),
+    'kernel': kernel.fileno(),
+    'cmdline': cmdline.fileno(),
+    'osrel': osrel.fileno(),
+    'initrd': initrd.fileno(),
+    'output': output.fileno(),
+  }
 
   # combine with objcopy
-  objcopy = subprocess.Popen([
-    "objcopy", "--verbose",
-    "--add-section", f".osrel=/dev/fd/{osrel_r}",
-    "--change-section-vma", ".osrel=0x0020000",
-    "--add-section", f".cmdline=/dev/fd/{cmdline_r}",
-    "--change-section-vma", ".cmdline=0x0030000",
-    "--add-section", f".linux={kernel}",
-    "--change-section-vma", ".linux=0x2000000",
-    "--add-section", f".initrd=/dev/fd/{initramfs_r}",
-    "--change-section-vma", ".initrd=0x3000000",
-    efistub, "/tmp/combined.efi"],
-    pass_fds=[osrel_r, cmdline_r, initramfs_r],
+  ret = subprocess.call([
+      "objcopy",
+      "--add-section", ".osrel=/dev/fd/%(osrel)d" % fds,
+      "--change-section-vma", ".osrel=0x0020000",
+      "--add-section", ".cmdline=/dev/fd/%(cmdline)d" % fds,
+      "--change-section-vma", ".cmdline=0x0030000",
+      "--add-section", ".linux=/dev/fd/%(kernel)d" % fds,
+      "--change-section-vma", ".linux=0x2000000",
+      "--add-section", ".initrd=/dev/fd/%(initrd)d" % fds,
+      "--change-section-vma", ".initrd=0x3000000",
+      "/dev/fd/%(efistub)d" % fds,
+      "/dev/fd/%(output)d" % fds,
+    ], pass_fds=fds.values(),
   )
 
-  # wait for processes and close pipes
-  # TODO: add timeout to wait and try:except to detect if objcopy crashes
-  cmdline_t.join()
-  osrel_t.join()
-  iniramfs_p.wait()
-  initramfs_w.close()
-  objcopy.wait()
+  return ret
 
 if __name__ == "__main__":
+  DEFAULT_EFISTUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
   parser = argparse.ArgumentParser()
-  parser.add_argument("-e", dest="efistub", help="efi stub", default="/usr/lib/systemd/boot/efi/linuxx64.efi.stub")
-  parser.add_argument("-k", dest="kernel", help="linux kernel", required=True)
-  parser.add_argument("-i", dest="initramfs", action="append", help="initramfs image", default=[])
+  parser.add_argument("-e", dest="efistub", help="efi loader stub", type=argparse.FileType('rb'), default=DEFAULT_EFISTUB)
+  parser.add_argument("-k", dest="kernel", help="linux kernel", type=argparse.FileType('rb'), required=True)
+  parser.add_argument("-i", dest="initramfs", help="initramfs image", type=argparse.FileType('rb'), nargs='*')
   parser.add_argument("-c", dest="cmdline", help="kernel commandline", default="")
-  parser.add_argument("-o", dest="output", help="output file", required=True)
+  parser.add_argument("-o", dest="output", help="output file", type=argparse.FileType('wb'), required=True)
   args = parser.parse_args()
   efistub_combine(**vars(args))
