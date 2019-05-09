@@ -9,6 +9,34 @@ import distro  # < req
 import re
 import os
 
+# parse version from kernel directly, k: file-object of opened kernel
+# https://github.com/file/file/blob/31a82018c2ed153b84ea5e115fa855de24eb46d1/magic/Magdir/linux#L109
+def parse_kernel_version(k):
+  import struct
+
+  # check 'magic' bytes
+  if not k.seek(514) or not k.read(4) == b"HdrS":
+    raise ValueError("%s is not a Linux kernel" % k.name)
+
+  # seek to version string
+  k.seek(526)
+  offset = struct.unpack('<h', k.read(2))[0]
+  k.seek(offset + 512)
+
+  # read and split kernel version
+  return k.read(256).split(b' ', 1)[0].decode()
+
+# parse /etc/os-release if it exists and return either PRETTY_NAME, NAME or 'Linux'
+def get_distro_name():
+  osdict = {}
+  try:
+    with open('/etc/os-release', 'rt') as osrel:
+      for line in osrel:
+        key, value = line.rstrip().split('=')
+        osdict[key] = value.strip('"\'')
+  finally:
+    return osdict.get('PRETTY_NAME', osdict.get('NAME', 'Linux'))
+
 def efistub_combine(efistub, kernel, initramfs, cmdline, output):
 
   # concatenate initramfs in pipe
