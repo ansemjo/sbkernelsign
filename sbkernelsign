@@ -33,6 +33,8 @@ class Configuration(object):
     DEFAULT_COMBINE = "/usr/bin/efistub-combine"
     DEFAULT_KEY = "/etc/efikeys/DatabaseKey.key"
     DEFAULT_CERT = "/etc/efikeys/DatabaseKey.crt"
+    DEFAULT_KERNELGLOB = "/boot/vmlinuz-*"
+    DEFAULT_KERNELREXP = "/?boot/vmlinuz-([^/]+)$"
 
     # initialize config parser with ${var} interpolation and loose section headers
     def __init__(self, file):
@@ -41,8 +43,8 @@ class Configuration(object):
         self.cfg.SECTCRE = compile(r"\[ *(?P<header>[^]]+?) *\]")
         self.cfg.read_file(file)
 
-        self.kernelg = self.cfg.get(self.GLOBAL, "kernelglob", fallback="/boot/vmlinuz-*")
-        self.kernelr = compile(self.cfg.get(self.GLOBAL, "kernelrexp", fallback="/?boot/vmlinuz-([^/]+)$"))
+        self.kernelg = self.cfg.get(self.GLOBAL, "kernelglob", fallback=self.DEFAULT_KERNELGLOB)
+        self.kernelr = compile(self.cfg.get(self.GLOBAL, "kernelrexp", fallback=self.DEFAULT_KERNELREXP))
 
         self.efistub = self.cfg.get(self.GLOBAL, "efistub", fallback=self.DEFAULT_EFISTUB)
         Run.script = self.cfg.get(self.GLOBAL, "combine", fallback=self.DEFAULT_COMBINE)
@@ -170,7 +172,7 @@ class Commandline(object):
         from argparse import ArgumentParser, FileType
 
         parser = ArgumentParser(description="Bundle and sign kernels for secureboot systems.")
-        commands = parser.add_subparsers(required=True, metavar="command", help="mode of operation")
+        commands = parser.add_subparsers(required=True, metavar="command", help="(for more information use: <command> --help)")
         defaults = {"config": Configuration.DEFAULT_CONFIGURATION, "logging": "INFO", "no_glob": False}
 
         # --- automatic mode ---
