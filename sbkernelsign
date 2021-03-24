@@ -18,6 +18,7 @@ from re import compile
 from glob import iglob
 import subprocess
 import logging
+from efistub import efistub_combine
 
 # get a named logger
 logger = lambda s: logging.getLogger(s)
@@ -30,7 +31,6 @@ class Configuration(object):
 
     DEFAULT_CONFIGURATION = "/etc/sbkernelsign.cfg"
     DEFAULT_EFISTUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
-    DEFAULT_COMBINE = "/usr/bin/efistub-combine"
     DEFAULT_KEY = "/etc/efikeys/DatabaseKey.key"
     DEFAULT_CERT = "/etc/efikeys/DatabaseKey.crt"
     DEFAULT_KERNELGLOB = "/boot/vmlinuz-*"
@@ -47,7 +47,6 @@ class Configuration(object):
         self.kernelr = compile(self.cfg.get(self.GLOBAL, "kernelrexp", fallback=self.DEFAULT_KERNELREXP))
 
         self.efistub = self.cfg.get(self.GLOBAL, "efistub", fallback=self.DEFAULT_EFISTUB)
-        Run.script = self.cfg.get(self.GLOBAL, "combine", fallback=self.DEFAULT_COMBINE)
 
         self.key = self.cfg.get(self.GLOBAL, "key", fallback=self.DEFAULT_KEY)
         self.cert = self.cfg.get(self.GLOBAL, "cert", fallback=self.DEFAULT_CERT)
@@ -67,7 +66,7 @@ class Configuration(object):
     def addsection(self, name):
         try:
             self.cfg.add_section(name)
-            logger(name).debug("kernel added")
+            logger("*").debug("kernel found: %s" % name)
         except DuplicateSectionError:
             pass
         return self.cfg[name]
@@ -96,25 +95,22 @@ class Configuration(object):
                 continue
 
         if len(kernels) == 0:
-            logger("*").warning("empty kernels list")
+            logger("*").warning("empty kernel list")
             exit(0)
 
         return kernels
 
-
 # things that call external binaries or scripts
 class Run(object):
-
-    # script for objcopy, should be set before use
-    script = None
 
     # combine efistub, kernel and initramfs into a single binary
     @staticmethod
     def objcopy(efistub, kernel, initramfs, cmdline, output):
-        cmd = [Run.script, "-v", "-e", efistub, "-k", kernel, "-c", cmdline, "-o", output]
-        for image in initramfs:
-            cmd.extend(["-i", image])
-        return subprocess.run(cmd, check=True)
+        efistub = open(efistub, 'rb')
+        kernel = open(kernel, 'rb')
+        initramfs = [open(i, 'rb') for i in initramfs]
+        output = open(output, 'wb')
+        return efistub_combine(efistub, kernel, initramfs, cmdline, output)
 
     # create a signature on the efistub binary
     @staticmethod
@@ -146,7 +142,7 @@ class Kernel(object):
 
     def print(self):
         # print info about this kernel
-        self.log.info("processing kernel")
+        self.log.info("combining kernel")
         for k in ("efistub", "kernel", "initramfs", "cmdline", "output"):
             self.log.debug(f"{k}: {getattr(self, k)}")
         return self
@@ -162,6 +158,7 @@ class Kernel(object):
         return self
 
     def sign(self):
+        self.log.info("signing kernel")
         Run.objcopy(self.efistub, self.kernel, self.initramfs, self.cmdline, self.output)
         Run.sbsign(self.key, self.cert, self.output)
         return self
@@ -199,7 +196,6 @@ class Commandline(object):
         manual.add_argument("-K", dest="key", help="signing key")
         manual.add_argument("-C", dest="cert", help="signing certificate")
         manual.add_argument("-e", dest="efistub", help="systemd-boot efistub")
-        manual.add_argument("-s", dest="script", help="efistub-combine script")
         manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
         manual.set_defaults(
             **defaults,
@@ -208,7 +204,6 @@ class Commandline(object):
                 "key": Configuration.DEFAULT_KEY,
                 "cert": Configuration.DEFAULT_CERT,
                 "efistub": Configuration.DEFAULT_EFISTUB,
-                "script": Configuration.DEFAULT_COMBINE,
                 "name": "manual",
             },
         )
@@ -216,7 +211,7 @@ class Commandline(object):
         args = parser.parse_args()
         loglevel = getattr(logging, args.logging or "INFO")
         logging.basicConfig(
-            format="\033[1m%(levelname)s \033[32m[%(name)s]\033[0m %(message)s", level=loglevel
+            format="\033[35m[%(name)s]\033[0m %(message)s", level=loglevel
         )
         args.func(args)
 
@@ -261,7 +256,6 @@ class Commandline(object):
     # fully manual mode
     def manual(self, args):
 
-        Run.script = args.script
         kernel = Kernel(**(args.__dict__))
         self.signall([kernel])
 
