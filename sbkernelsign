@@ -8,132 +8,95 @@
 # enabled SecureBoot. The DatabaseKey.key must be enrolled in your
 # firmware for this to work.
 
-# TODO: handle kernel deletion by deleting signed binary?
-# TODO: add 'sign' command to sign single extra binaries
+# minimum Python 3.8 required: f"" strings and := operators
 
-import sys
-import os
-from configparser import ConfigParser, ExtendedInterpolation, DuplicateSectionError
-from re import compile
-from glob import iglob
-import subprocess
-import logging
+# TODO: add 'sign' command to sign single extra binaries
+# TODO: return osrel data from efistub_combine for logging
+# TODO: add name to osrel info for bootloader selections
+
+import sys, os, re, subprocess, logging, string, configparser as cfp
 from efistub import efistub_combine, parse_kernelversion
 
 # get a named logger
 logger = lambda s: logging.getLogger(s)
 
-# return a config section as dict for **kwargs
-sectdict = lambda s: dict(s.items())
-
-# configuration element
+# configuration element from file and searching for kernels
 class Configuration(object):
 
     DEFAULT_CONFIGURATION = "/etc/sbkernelsign.cfg"
-    DEFAULT_STUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
-    DEFAULT_KEY = "/etc/efikeys/DatabaseKey.key"
-    DEFAULT_CERT = "/etc/efikeys/DatabaseKey.crt"
-    DEFAULT_BOOT = "/boot"
-    DEFAULT_REXP = "(?:.*/|)vmlinuz-([^/]+)$"
 
-    # initialize config parser with ${var} interpolation and loose section headers
+    # default configuration values
+    DEFAULTS = {
+        "boot" : "/boot",
+        "rexp" : "(?:.*/|)vmlinuz-([^/]+)$$",
+        "stub" : "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+        "key"  : "/etc/efikeys/DatabaseKey.key",
+        "cert" : "/etc/efikeys/DatabaseKey.crt",
+    }
+
+    # extended interpolation where ${section} is always the section name
+    class ExtendedSectionInterpolation(cfp.ExtendedInterpolation):
+        def before_get(self, parser, section, option, value, defaults):
+            parser.set(section, "section", section)
+            return super().before_get(parser, section, option, value, defaults)
+    
+    # initialize config parser with extended ${variable} interpolation
     def __init__(self, file):
-
-        self.cfg = ConfigParser(interpolation=ExtendedInterpolation())
-        self.cfg.SECTCRE = compile(r"\[ *(?P<header>[^]]+?) *\]")
+        self.cfg = cfp.ConfigParser(interpolation=self.ExtendedSectionInterpolation())
         self.cfg.read_file(file)
 
-        self.boot = self.cfg.get(self.GLOBAL, "boot", fallback=self.DEFAULT_BOOT)
-        self.rexp = compile(self.cfg.get(self.GLOBAL, "rexp", fallback=self.DEFAULT_REXP))
-
-        self.stub = self.cfg.get(self.GLOBAL, "stub", fallback=self.DEFAULT_STUB)
-
-        self.key = self.cfg.get(self.GLOBAL, "key", fallback=self.DEFAULT_KEY)
-        self.cert = self.cfg.get(self.GLOBAL, "cert", fallback=self.DEFAULT_CERT)
-
-    # return globals as dict
-    GLOBAL = "global"
-
-    def globals(self):
-        return {"stub": self.stub, "key": self.key, "cert": self.cert}
+        # write missing default values to DEFAULT section for interpolation
+        for key in filter(lambda k: k not in self.cfg.defaults().keys(), self.DEFAULTS.keys()):
+            self.cfg.set(self.cfg.default_section, key, self.DEFAULTS[key])
 
     # add sections by globbing for kernels on filesystem
-    def addglob(self):
-        logger("*").debug(f"searching for kernels in {self.boot} with {self.rexp}")
-        for f in os.scandir(self.boot):
-            if f.is_file():
-                m = self.rexp.findall(f.path)
-                if m: self.addsection(m[0][1])
+    def find_kernels(self):
+        boot, rexp = (self.cfg.get(self.cfg.default_section, k) for k in ["boot", "rexp"])
+        logger("*").debug(f"find kernels in {boot} with /{rexp}/")
+        kre = re.compile(rexp)
+        for file in filter(lambda f: f.is_file(), os.scandir(boot)):
+            if (match := kre.match(file.path)):
+                name = match.group(1)
+                logger("*").debug(f"kernel found: {name}")
+                self.add_section(name)
 
-    # ensures that a named section is present
-    def addsection(self, name):
-        try:
-            self.cfg.add_section(name)
-            logger("*").debug("kernel found: %s" % name)
-        except DuplicateSectionError:
-            pass
+    # ensure that a named kernel config section is present
+    def add_section(self, name):
+        try: self.cfg.add_section(name)
+        except cfp.DuplicateSectionError: pass
         return self.cfg[name]
 
-    def kernels(self, targets=None):
+    # return a generator of Kernel objects for processing
+    def kernels(self, specific=None):
+        sections = (self.cfg.sections() if specific is None else specific)
+        if not len(sections):
+            logger("*").debug("empty kernels list")
+            sys.exit(1)
 
-        kernels = []
-        sections = (s for s in (self.cfg.sections() if targets is None else targets) if s != self.GLOBAL)
-
+        # generate the configurations
         for name in sections:
-            section = self.addsection(name)
-            log = logger(name)
+            section = self.add_section(name)
 
-            if "ignore" in section and section.getboolean("ignore"):
-                log.debug("ignored")
+            # skip if explicitly ignored
+            if section.getboolean("ignore", False):
+                logger(name).debug("ignored")
                 continue
-
-            if not "name" in section:
-                section["name"] = name.strip()
 
             try:
-                k = Kernel(name, **self.globals(), **sectdict(section))
-                kernels.append(k)
+                yield Kernel(name, **dict(section.items()))
             except TypeError as e:
-                log.error(f"missing attribute: {e}")
+                logger(name).error(f"missing attribute: {e}")
                 continue
-
-        if len(kernels) == 0:
-            logger("*").warning("empty kernel list")
-            exit(0)
-
-        return kernels
-
-# things that call external binaries or scripts
-class Run(object):
-
-    # combine efistub, kernel and initramfs into a single binary
-    @staticmethod
-    def objcopy(stub, kernel, initramfs, cmdline, output):
-        stub = open(stub, 'rb')
-        kernel = open(kernel, 'rb')
-        initramfs = [open(i, 'rb') for i in initramfs]
-        output = open(output, 'wb')
-        # TODO: return osrel data from efistub_combine
-        # TODO: add name to osrel info
-        v = parse_kernelversion(kernel)
-        print(f"kernel version: {v}")
-        return efistub_combine(stub, kernel, initramfs, cmdline, output)
-
-    # create a signature on the combined binary
-    @staticmethod
-    def sbsign(key, cert, binary):
-        cmd = ["sbsign", "--key", key, "--cert", cert, "--output", binary, binary]
-        return subprocess.run(cmd, check=True)
 
 
 # a single kernel signing configuration with its processing steps
 class Kernel(object):
-    def __init__(self, logname, name, stub, kernel, initramfs, cmdline, key, cert, output, **rest):
+    def __init__(self, name, stub, kernel, initrd, cmdline, key, cert, output, **rest):
         self.name = name
-        self.log = logger(logname)
+        self.log = logger(name)
         self.stub = stub
         self.kernel = kernel
-        self.initramfs = initramfs if type(initramfs) == list else initramfs.strip().splitlines()
+        self.initrd = initrd if type(initrd) == list else initrd.strip().splitlines()
         self.cmdline = cmdline
         self.key = key
         self.cert = cert
@@ -143,14 +106,14 @@ class Kernel(object):
         if not os.path.isfile(self.kernel):
             raise TypeError("kernel removed")
         # all other files should exist
-        for f in [self.stub] + self.initramfs + [self.key, self.cert]:
+        for f in [self.stub] + self.initrd + [self.key, self.cert]:
             if not os.path.isfile(f):
                 raise FileNotFoundError(self.name + ": " + f)
 
     def print(self):
         # print info about this kernel
         self.log.info(f"combining and signing kernel")
-        for k in ("stub", "kernel", "initramfs", "cmdline", "output"):
+        for k in ("stub", "kernel", "initrd", "cmdline", "output"):
             self.log.debug(f"{k}: {getattr(self, k)}")
         return self
 
@@ -165,9 +128,26 @@ class Kernel(object):
         return self
 
     def sign(self):
-        Run.objcopy(self.stub, self.kernel, self.initramfs, self.cmdline, self.output)
-        Run.sbsign(self.key, self.cert, self.output)
+        #Kernel.objcopy(self.stub, self.kernel, self.initrd, self.cmdline, self.output)
+        #Kernel.sbsign(self.key, self.cert, self.output)
         return self
+
+    # combine efistub, kernel and initrd into a single binary
+    @staticmethod
+    def objcopy(stub, kernel, initrd, cmdline, output):
+        stub = open(stub, 'rb')
+        kernel = open(kernel, 'rb')
+        initrd = [open(i, 'rb') for i in initrd]
+        output = open(output, 'wb')
+        v = parse_kernelversion(kernel)
+        print(f"kernel version: {v}")
+        return efistub_combine(stub, kernel, initrd, cmdline, output)
+
+    # create a signature on the combined binary
+    @staticmethod
+    def sbsign(key, cert, binary):
+        cmd = ["sbsign", "--key", key, "--cert", cert, "--output", binary, binary]
+        return subprocess.run(cmd, check=True)
 
 
 class Commandline(object):
@@ -188,31 +168,21 @@ class Commandline(object):
         # --- hook mode ---
         hook = commands.add_parser("hook", help="hook mode for pacman")
         hook.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
+        hook.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
         hook.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
         hook.set_defaults(**defaults, func=self.hook)
 
         # --- manual mode ---
         manual = commands.add_parser("manual", help="manual, all args provided")
         manual.add_argument("-k", dest="kernel", help="kernel binary", required=True)
-        manual.add_argument(
-            "-i", dest="initramfs", help="initramfs list", nargs="+", metavar="IMG", required=True
-        )
+        manual.add_argument("-i", dest="initrd", help="initrd list", nargs="+", metavar="IMG", required=True)
         manual.add_argument("-c", dest="cmdline", help="kernel cmdline", required=True)
         manual.add_argument("-o", dest="output", help="signed kernel output", required=True)
         manual.add_argument("-K", dest="key", help="signing key")
         manual.add_argument("-C", dest="cert", help="signing certificate")
         manual.add_argument("-e", dest="stub", help="systemd-boot efistub")
         manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
-        manual.set_defaults(
-            **defaults,
-            func=self.manual,
-            **{
-                "key": Configuration.DEFAULT_KEY,
-                "cert": Configuration.DEFAULT_CERT,
-                "stub": Configuration.DEFAULT_STUB,
-                "name": "manual",
-            },
-        )
+        manual.set_defaults(**defaults, func=self.manual, name="manual")
 
         args = parser.parse_args()
         loglevel = getattr(logging, args.logging or "INFO")
@@ -226,8 +196,7 @@ class Commandline(object):
 
         # open configuration, add globbing
         conf = Configuration(args.config)
-        if not args.no_glob:
-            conf.addglob()
+        if not args.no_glob: conf.find_kernels()
 
         # combine and sign kernels
         self.signall(conf.kernels())
@@ -247,13 +216,13 @@ class Commandline(object):
                 continue
             # add matches to list of targets
             name = match.group(1)
-            conf.addsection(name)
+            conf.add_section(name)
             targets.append(name)
 
         # if any target did not match kernel regexp, force auto rebuild
         if force:
             logger("*").info("forced complete resign")
-            conf.addglob()
+            if not args.no_glob: conf.find_kernels()
             targets = None
 
         # combine and sign kernels
