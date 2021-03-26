@@ -10,11 +10,7 @@
 
 # minimum Python 3.8 required: f"" strings and := operators
 
-# TODO: add 'sign' command to sign single extra binaries
-# TODO: return osrel data from efistub_combine for logging
-# TODO: add name to osrel info for bootloader selections
-
-import sys, os, re, subprocess, logging, string, configparser as cfp
+import sys, os, re, subprocess, logging, string, shutil, configparser as cfp
 from efistub import efistub_combine, parse_kernelversion
 
 # get a named logger
@@ -22,8 +18,6 @@ logger = lambda s: logging.getLogger(s)
 
 # configuration element from file and searching for kernels
 class Configuration(object):
-
-    DEFAULT_CONFIGURATION = "/etc/sbkernelsign.cfg"
 
     # default configuration values
     DEFAULTS = {
@@ -49,12 +43,15 @@ class Configuration(object):
         for key in filter(lambda k: k not in self.cfg.defaults().keys(), self.DEFAULTS.keys()):
             self.cfg.set(self.cfg.default_section, key, self.DEFAULTS[key])
 
+        # assign boot and rexp on self because they're needed
+        self.boot = self.cfg.get(self.cfg.default_section, "boot")
+        self.rexp = self.cfg.get(self.cfg.default_section, "rexp")
+
     # add sections by globbing for kernels on filesystem
     def find_kernels(self):
-        boot, rexp = (self.cfg.get(self.cfg.default_section, k) for k in ["boot", "rexp"])
-        logger("*").debug(f"find kernels in {boot} with /{rexp}/")
-        kre = re.compile(rexp)
-        for file in filter(lambda f: f.is_file(), os.scandir(boot)):
+        logger("*").debug(f"find kernels in {self.boot} with /{self.rexp}/")
+        kre = re.compile(self.rexp)
+        for file in filter(lambda f: f.is_file(), os.scandir(self.boot)):
             if (match := kre.match(file.path)):
                 name = match.group(1)
                 logger("*").debug(f"kernel found: {name}")
@@ -82,81 +79,88 @@ class Configuration(object):
                 logger(name).debug("ignored")
                 continue
 
-            try:
-                yield Kernel(name, **dict(section.items()))
-            except TypeError as e:
-                logger(name).error(f"missing attribute: {e}")
-                continue
+            # transform initrd to list
+            items = dict(section.items())
+            items["initrd"] = items["initrd"].strip().splitlines()
+
+            # yield a kernel configuration from interpolated values
+            yield Kernel(name, **items)
 
 
-# a single kernel signing configuration with its processing steps
+# a single kernel signing configuration and its processing steps
 class Kernel(object):
+
+    # many functions herein return self for dot-chaining
     def __init__(self, name, stub, kernel, initrd, cmdline, key, cert, output, **rest):
         self.name = name
         self.log = logger(name)
         self.stub = stub
         self.kernel = kernel
-        self.initrd = initrd if type(initrd) == list else initrd.strip().splitlines()
+        self.initrd = initrd
         self.cmdline = cmdline
         self.key = key
         self.cert = cert
         self.output = output
 
-        # skip removed kernels
-        if not os.path.isfile(self.kernel):
-            raise TypeError("kernel removed")
-        # all other files should exist
-        for f in [self.stub] + self.initrd + [self.key, self.cert]:
-            if not os.path.isfile(f):
-                raise FileNotFoundError(self.name + ": " + f)
-
-    def print(self):
-        # print info about this kernel
-        self.log.info(f"combining and signing kernel")
-        for k in ("stub", "kernel", "initrd", "cmdline", "output"):
-            self.log.debug(f"{k}: {getattr(self, k)}")
+    # check if all expected files are present and readable
+    # TODO: special case for hooks with removed files
+    def checkfiles(self):
+        for file in [self.kernel, self.stub, *self.initrd, self.key, self.cert]:
+            if not os.path.isfile(file):
+                raise FileNotFoundError(f"not a file: {file}")
+            if not os.access(file, os.R_OK):
+                raise PermissionError(f"cannot read file: {file}")
         return self
 
-    def backup(self, suffix):
-        import shutil
-        import os
+    # print info about this config
+    def info(self):
+        for k in ("stub", "kernel", "initrd", "cmdline", "output"):
+            self.log.debug(f"{k:7s}: {getattr(self, k)}")
+        return self
 
+    # backup existing kernels with a suffix in place
+    def backup(self, suffix="~"):
         if os.path.isfile(self.output):
             backup = self.output + suffix
             shutil.copy2(self.output, backup)
-            self.log.debug("backed up old kernel to " + backup)
-        return self
-
-    def sign(self):
-        #Kernel.objcopy(self.stub, self.kernel, self.initrd, self.cmdline, self.output)
-        #Kernel.sbsign(self.key, self.cert, self.output)
+            self.log.debug(f"backed up old kernel to {backup}")
         return self
 
     # combine efistub, kernel and initrd into a single binary
-    @staticmethod
-    def objcopy(stub, kernel, initrd, cmdline, output):
-        stub = open(stub, 'rb')
-        kernel = open(kernel, 'rb')
-        initrd = [open(i, 'rb') for i in initrd]
-        output = open(output, 'wb')
-        v = parse_kernelversion(kernel)
-        print(f"kernel version: {v}")
-        return efistub_combine(stub, kernel, initrd, cmdline, output)
+    def objcopy(self, hook=False):
+        stub = open(self.stub, 'rb')
+        kernel = open(self.kernel, 'rb')
+        initrd = [open(i, 'rb') for i in self.initrd]
+        output = open(self.output, 'wb')
+        # TODO: add verbose flag to print version / osrel
+        # TODO: add name to osrel info for bootloader selections
+        efistub_combine(stub, kernel, initrd, self.cmdline, output)
+        return self
 
     # create a signature on the combined binary
-    @staticmethod
-    def sbsign(key, cert, binary):
-        cmd = ["sbsign", "--key", key, "--cert", cert, "--output", binary, binary]
-        return subprocess.run(cmd, check=True)
+    def sbsign(self):
+        cmd = ["sbsign", "--key", self.key, "--cert", self.cert, "--output", self.output, self.output]
+        subprocess.run(cmd, check=True)
+        return self
+
+    # run all of the above
+    def combine(self):
+        return self.checkfiles().info().backup().objcopy().sbsign()
 
 
+# parse the commandline and run the appropriate function
+# TODO: add 'sign' command to sign single extra binaries
 class Commandline(object):
     def __init__(self):
         from argparse import ArgumentParser, FileType
 
         parser = ArgumentParser(description="Bundle and sign kernels for secureboot systems.")
         commands = parser.add_subparsers(required=True, metavar="command", help="(for more information use: <command> --help)")
-        defaults = {"config": Configuration.DEFAULT_CONFIGURATION, "logging": "INFO", "no_glob": False}
+        defaults = {
+            "config": "/etc/sbkernelsign.cfg",
+            "logging": "INFO",
+            "no_glob": False
+        }
 
         # --- automatic mode ---
         auto = commands.add_parser("auto", help="automatic, from configuration file")
@@ -178,49 +182,42 @@ class Commandline(object):
         manual.add_argument("-i", dest="initrd", help="initrd list", nargs="+", metavar="IMG", required=True)
         manual.add_argument("-c", dest="cmdline", help="kernel cmdline", required=True)
         manual.add_argument("-o", dest="output", help="signed kernel output", required=True)
-        manual.add_argument("-K", dest="key", help="signing key")
-        manual.add_argument("-C", dest="cert", help="signing certificate")
-        manual.add_argument("-e", dest="stub", help="systemd-boot efistub")
+        manual.add_argument("-K", dest="key", help="signing key", required=True)
+        manual.add_argument("-C", dest="cert", help="signing certificate", required=True)
+        manual.add_argument("-e", dest="stub", help="systemd-boot efistub", required=True)
         manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
-        manual.set_defaults(**defaults, func=self.manual, name="manual")
+        manual.set_defaults(**defaults, func=self.manual)
 
         args = parser.parse_args()
         loglevel = getattr(logging, args.logging or "INFO")
-        logging.basicConfig(
-            format="[%(name)s] %(message)s", level=loglevel
-        )
+        logging.basicConfig(format="[%(name)s] %(message)s", level=loglevel)
         args.func(args)
 
-    # automatic mode
+    # automatic mode: search for kernels and combine all
     def auto(self, args):
-
-        # open configuration, add globbing
         conf = Configuration(args.config)
         if not args.no_glob: conf.find_kernels()
-
-        # combine and sign kernels
         self.signall(conf.kernels())
 
-    # hook mode for pacman
+    # hook mode for package managers: parse changed targets from stdin
     def hook(self, args):
-
-        # open configuration
         conf = Configuration(args.config)
-
-        # parse targets on stdin
-        targets, force = [], False
+        targets, full = [], False
+        kre = re.compile(conf.rexp)
+        
+        # check lines
         for line in (line.strip() for _, line in enumerate(sys.stdin)):
-            match = conf.rexp.match(line)
-            if match is None:
-                force = True
+            if (match := kre.match(line)):
+                # add all kernel rexp matches to a list
+                name = match.group(1)
+                targets.append(name)
+            else:
+                # if any is not a kernel, force full resign
+                full = True
                 continue
-            # add matches to list of targets
-            name = match.group(1)
-            conf.add_section(name)
-            targets.append(name)
 
-        # if any target did not match kernel regexp, force auto rebuild
-        if force:
+        # full auto rebuild if any target did not match kernel regexp
+        if full:
             logger("*").info("forced complete resign")
             if not args.no_glob: conf.find_kernels()
             targets = None
@@ -228,16 +225,19 @@ class Commandline(object):
         # combine and sign kernels
         self.signall(conf.kernels(targets))
 
-    # fully manual mode
+    # fully manual mode, all arguments specified
     def manual(self, args):
-
-        kernel = Kernel(**(args.__dict__))
+        kernel = Kernel("manual", **(args.__dict__))
         self.signall([kernel])
 
     # helper to perform combine and sign
-    def signall(self, kernels, backup=".bak"):
+    def signall(self, kernels):
         for k in kernels:
-            k.print().backup(backup).sign()
+            try:
+                k.combine()
+            except Exception as e:
+                k.log.error(e)
+                sys.exit(1)
 
 
 # ------- let's go -------
