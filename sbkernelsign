@@ -18,7 +18,7 @@ from re import compile
 from glob import iglob
 import subprocess
 import logging
-from efistub import efistub_combine
+from efistub import efistub_combine, parse_kernelversion
 
 # get a named logger
 logger = lambda s: logging.getLogger(s)
@@ -30,11 +30,11 @@ sectdict = lambda s: dict(s.items())
 class Configuration(object):
 
     DEFAULT_CONFIGURATION = "/etc/sbkernelsign.cfg"
-    DEFAULT_EFISTUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+    DEFAULT_STUB = "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
     DEFAULT_KEY = "/etc/efikeys/DatabaseKey.key"
     DEFAULT_CERT = "/etc/efikeys/DatabaseKey.crt"
-    DEFAULT_KERNELGLOB = "/boot/vmlinuz-*"
-    DEFAULT_KERNELREXP = "/?boot/vmlinuz-([^/]+)$"
+    DEFAULT_BOOT = "/boot"
+    DEFAULT_REXP = "(?:.*/|)vmlinuz-([^/]+)$"
 
     # initialize config parser with ${var} interpolation and loose section headers
     def __init__(self, file):
@@ -43,10 +43,10 @@ class Configuration(object):
         self.cfg.SECTCRE = compile(r"\[ *(?P<header>[^]]+?) *\]")
         self.cfg.read_file(file)
 
-        self.kernelg = self.cfg.get(self.GLOBAL, "kernelglob", fallback=self.DEFAULT_KERNELGLOB)
-        self.kernelr = compile(self.cfg.get(self.GLOBAL, "kernelrexp", fallback=self.DEFAULT_KERNELREXP))
+        self.boot = self.cfg.get(self.GLOBAL, "boot", fallback=self.DEFAULT_BOOT)
+        self.rexp = compile(self.cfg.get(self.GLOBAL, "rexp", fallback=self.DEFAULT_REXP))
 
-        self.efistub = self.cfg.get(self.GLOBAL, "efistub", fallback=self.DEFAULT_EFISTUB)
+        self.stub = self.cfg.get(self.GLOBAL, "stub", fallback=self.DEFAULT_STUB)
 
         self.key = self.cfg.get(self.GLOBAL, "key", fallback=self.DEFAULT_KEY)
         self.cert = self.cfg.get(self.GLOBAL, "cert", fallback=self.DEFAULT_CERT)
@@ -55,12 +55,15 @@ class Configuration(object):
     GLOBAL = "global"
 
     def globals(self):
-        return {"efistub": self.efistub, "key": self.key, "cert": self.cert}
+        return {"stub": self.stub, "key": self.key, "cert": self.cert}
 
     # add sections by globbing for kernels on filesystem
     def addglob(self):
-        for name in (self.kernelr.sub(r"\1", k) for k in iglob(self.kernelg)):
-            self.addsection(name)
+        logger("*").debug(f"searching for kernels in {self.boot} with {self.rexp}")
+        for f in os.scandir(self.boot):
+            if f.is_file():
+                m = self.rexp.findall(f.path)
+                if m: self.addsection(m[0][1])
 
     # ensures that a named section is present
     def addsection(self, name):
@@ -88,7 +91,7 @@ class Configuration(object):
                 section["name"] = name.strip()
 
             try:
-                k = Kernel(**self.globals(), **sectdict(section))
+                k = Kernel(name, **self.globals(), **sectdict(section))
                 kernels.append(k)
             except TypeError as e:
                 log.error(f"missing attribute: {e}")
@@ -105,14 +108,18 @@ class Run(object):
 
     # combine efistub, kernel and initramfs into a single binary
     @staticmethod
-    def objcopy(efistub, kernel, initramfs, cmdline, output):
-        efistub = open(efistub, 'rb')
+    def objcopy(stub, kernel, initramfs, cmdline, output):
+        stub = open(stub, 'rb')
         kernel = open(kernel, 'rb')
         initramfs = [open(i, 'rb') for i in initramfs]
         output = open(output, 'wb')
-        return efistub_combine(efistub, kernel, initramfs, cmdline, output)
+        # TODO: return osrel data from efistub_combine
+        # TODO: add name to osrel info
+        v = parse_kernelversion(kernel)
+        print(f"kernel version: {v}")
+        return efistub_combine(stub, kernel, initramfs, cmdline, output)
 
-    # create a signature on the efistub binary
+    # create a signature on the combined binary
     @staticmethod
     def sbsign(key, cert, binary):
         cmd = ["sbsign", "--key", key, "--cert", cert, "--output", binary, binary]
@@ -121,10 +128,10 @@ class Run(object):
 
 # a single kernel signing configuration with its processing steps
 class Kernel(object):
-    def __init__(self, name, efistub, kernel, initramfs, cmdline, key, cert, output, **rest):
+    def __init__(self, logname, name, stub, kernel, initramfs, cmdline, key, cert, output, **rest):
         self.name = name
-        self.log = logger(self.name)
-        self.efistub = efistub
+        self.log = logger(logname)
+        self.stub = stub
         self.kernel = kernel
         self.initramfs = initramfs if type(initramfs) == list else initramfs.strip().splitlines()
         self.cmdline = cmdline
@@ -136,14 +143,14 @@ class Kernel(object):
         if not os.path.isfile(self.kernel):
             raise TypeError("kernel removed")
         # all other files should exist
-        for f in [self.efistub] + self.initramfs + [self.key, self.cert]:
+        for f in [self.stub] + self.initramfs + [self.key, self.cert]:
             if not os.path.isfile(f):
                 raise FileNotFoundError(self.name + ": " + f)
 
     def print(self):
         # print info about this kernel
-        self.log.info("combining kernel")
-        for k in ("efistub", "kernel", "initramfs", "cmdline", "output"):
+        self.log.info(f"combining and signing kernel")
+        for k in ("stub", "kernel", "initramfs", "cmdline", "output"):
             self.log.debug(f"{k}: {getattr(self, k)}")
         return self
 
@@ -158,8 +165,7 @@ class Kernel(object):
         return self
 
     def sign(self):
-        self.log.info("signing kernel")
-        Run.objcopy(self.efistub, self.kernel, self.initramfs, self.cmdline, self.output)
+        Run.objcopy(self.stub, self.kernel, self.initramfs, self.cmdline, self.output)
         Run.sbsign(self.key, self.cert, self.output)
         return self
 
@@ -195,7 +201,7 @@ class Commandline(object):
         manual.add_argument("-o", dest="output", help="signed kernel output", required=True)
         manual.add_argument("-K", dest="key", help="signing key")
         manual.add_argument("-C", dest="cert", help="signing certificate")
-        manual.add_argument("-e", dest="efistub", help="systemd-boot efistub")
+        manual.add_argument("-e", dest="stub", help="systemd-boot efistub")
         manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
         manual.set_defaults(
             **defaults,
@@ -203,7 +209,7 @@ class Commandline(object):
             **{
                 "key": Configuration.DEFAULT_KEY,
                 "cert": Configuration.DEFAULT_CERT,
-                "efistub": Configuration.DEFAULT_EFISTUB,
+                "stub": Configuration.DEFAULT_STUB,
                 "name": "manual",
             },
         )
@@ -211,7 +217,7 @@ class Commandline(object):
         args = parser.parse_args()
         loglevel = getattr(logging, args.logging or "INFO")
         logging.basicConfig(
-            format="\033[35m[%(name)s]\033[0m %(message)s", level=loglevel
+            format="[%(name)s] %(message)s", level=loglevel
         )
         args.func(args)
 
@@ -235,18 +241,18 @@ class Commandline(object):
         # parse targets on stdin
         targets, force = [], False
         for line in (line.strip() for _, line in enumerate(sys.stdin)):
-            match = conf.kernelr.match(line)
+            match = conf.rexp.match(line)
             if match is None:
                 force = True
                 continue
             # add matches to list of targets
-            name = match.expand(r"\1")
+            name = match.group(1)
             conf.addsection(name)
             targets.append(name)
 
         # if any target did not match kernel regexp, force auto rebuild
         if force:
-            logger("*").info("forced rebuild")
+            logger("*").info("forced complete resign")
             conf.addglob()
             targets = None
 
