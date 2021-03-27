@@ -1,3 +1,4 @@
 /pki
 /esp
 **/__pycache__
+.vscode/

@@ -21,11 +21,17 @@ class Configuration(object):
 
     # default configuration values
     DEFAULTS = {
-        "boot" : "/boot",
-        "rexp" : "(?:.*/|)vmlinuz-([^/]+)$$",
-        "stub" : "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
-        "key"  : "/etc/efikeys/DatabaseKey.key",
-        "cert" : "/etc/efikeys/DatabaseKey.crt",
+        "boot"    : "/boot",
+        "esp"     : "${boot}/efi",
+        "output"  : "${esp}/EFI/Linux/${section}.efi",
+        "rexp"    : "(?:.*/|)vmlinuz-([^/]+)$$",
+        "stub"    : "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+        "pki"     : "/etc/efikeys",
+        "key"     : "${pki}/DatabaseKey.key",
+        "cert"    : "${pki}/DatabaseKey.crt",
+        "kernel"  : "${boot}/vmlinuz-${section}",
+        "initrd"  : "${boot}/initramfs-${section}.img",
+        "cmdline" : "quiet",
     }
 
     # extended interpolation where ${section} is always the section name
