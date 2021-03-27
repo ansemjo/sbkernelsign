@@ -41,11 +41,16 @@ def get_distroname(osrel_file = "/etc/os-release"):
 
 # generate a new os-release dynamically for embedding with efistub
 # https://github.com/systemd/systemd/blob/72830b187f5aa06b3e89ca121bbc35451764f1bc/docs/BOOT_LOADER_SPECIFICATION.md#type-2-efi-unified-kernel-images
-def generate_osrel(kernel):
+def generate_osrel(kernel, log=False, name=None):
   t = __tempfile.SpooledTemporaryFile(mode='wt+')
-  print('NAME="%s"' % get_distroname(), file=t)
-  print('ID="%s"' % __os.path.basename(kernel.name), file=t)
-  print('VERSION_ID="%s"' % parse_kernelversion(kernel), file=t)
+  distro = get_distroname()
+  print('NAME="%s"' % distro, file=t)
+  if log: print("os name: %s" % distro)
+  name = __os.path.basename(kernel.name) if name is None else name
+  print('ID="%s"' % name, file=t)
+  version = parse_kernelversion(kernel)
+  print('VERSION_ID="%s"' % version, file=t)
+  if log: print("kernel version: %s" % version)
   t.seek(0)
   return t
 
@@ -66,13 +71,13 @@ def stof(s):
   return t
 
 # combine kernel and initramfs in a single efi executable with a stub
-def efistub_combine(efistub, kernel, initrd, cmdline, output):
+def efistub_combine(efistub, kernel, initrd, cmdline, output, verbose=False, name=None):
 
   # write cmdline to tempfile
   cmdline = stof(cmdline)
 
   # generate an os-release for embedding
-  osrel = generate_osrel(kernel)
+  osrel = generate_osrel(kernel, verbose, name)
 
   # concatenate initramfs in memory
   initrd = concat(initrd)

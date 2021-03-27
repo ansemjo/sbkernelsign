@@ -114,6 +114,7 @@ class Kernel(object):
 
     # print info about this config
     def info(self):
+        self.log.info("signing combined kernel")
         for k in ("stub", "kernel", "initrd", "cmdline", "output"):
             self.log.debug(f"{k:7s}: {getattr(self, k)}")
         return self
@@ -132,9 +133,8 @@ class Kernel(object):
         kernel = open(self.kernel, 'rb')
         initrd = [open(i, 'rb') for i in self.initrd]
         output = open(self.output, 'wb')
-        # TODO: add verbose flag to print version / osrel
         # TODO: add name to osrel info for bootloader selections
-        efistub_combine(stub, kernel, initrd, self.cmdline, output)
+        efistub_combine(stub, kernel, initrd, self.cmdline, output, True, self.name)
         return self
 
     # create a signature on the combined binary
