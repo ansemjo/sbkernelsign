@@ -44,7 +44,7 @@ def get_distroname(osrel_file = "/etc/os-release"):
 def generate_osrel(kernel, log=False, name=None):
   t = __tempfile.SpooledTemporaryFile(mode='wt+')
   distro = get_distroname()
-  print('NAME="%s"' % distro, file=t)
+  print('PRETTY_NAME="%s"' % distro, file=t)
   if log: print("os name: %s" % distro)
   name = __os.path.basename(kernel.name) if name is None else name
   print('ID="%s"' % name, file=t)
@@ -66,7 +66,7 @@ def concat(files):
 # write a string to tempfile
 def stof(s):
   t = __tempfile.SpooledTemporaryFile(mode='wt+')
-  print(s, file=t)
+  t.write(str(s))
   t.seek(0)
   return t
 
