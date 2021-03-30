@@ -283,25 +283,20 @@ class SBKernelSignCmd(object):
         from argparse import ArgumentParser, FileType
 
         parser = ArgumentParser(description="Bundle and sign kernels for secureboot systems.")
-        commands = parser.add_subparsers(required=True, metavar="command", help="(for more information use: <command> --help)")
-        defaults = {
-            "config": "/etc/sbkernelsign.cfg",
-            "logging": "INFO",
-            "no_glob": False
-        }
+        parser.add_argument("-v", "--verbose", help="increase logging verbosity", action="count", default=2)
+        commands = parser.add_subparsers(required=True, metavar="command", help="for help use: <command> --help")
+        defaults = dict(config="/etc/sbkernelsign.cfg", no_glob=False)
 
         # --- automatic mode ---
         auto = commands.add_parser("auto", help="automatic, from configuration file")
         auto.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
         auto.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
-        auto.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
         auto.set_defaults(**defaults, func=self.auto)
 
         # --- hook mode ---
         hook = commands.add_parser("hook", help="hook mode for pacman")
         hook.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
         hook.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
-        hook.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
         hook.set_defaults(**defaults, func=self.hook)
 
         # --- manual mode ---
@@ -313,19 +308,23 @@ class SBKernelSignCmd(object):
         manual.add_argument("-K", dest="key", help="signing key", required=True)
         manual.add_argument("-C", dest="cert", help="signing certificate", required=True)
         manual.add_argument("-e", dest="stub", help="systemd-boot efistub", required=True)
-        manual.add_argument("--logging", help="set logging level", choices=["INFO", "DEBUG", "WARN"])
         manual.set_defaults(**defaults, func=self.manual)
 
         args = parser.parse_args()
-        loglevel = getattr(logging, args.logging or "INFO")
-        logging.basicConfig(format="[%(name)s] %(message)s", level=loglevel)
+        
+        # configure logging format and verbosity
+        level = [logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG]
+        level = level[min(len(level) - 1, args.verbose)]
+        logging.basicConfig(format="[%(name)s] %(message)s", level=level)
+        
+        # run subcommand
         args.func(args)
 
     # automatic mode: search for kernels and combine all
     def auto(self, args):
         conf = Configuration(args.config)
         if not args.no_glob: conf.find_kernels()
-        self.signall(conf.kernels())
+        self.do(conf.kernels())
 
     # hook mode for package managers: parse changed targets from stdin
     def hook(self, args):
@@ -348,20 +347,19 @@ class SBKernelSignCmd(object):
         if full:
             logger("*").info("forced complete resign")
             if not args.no_glob: conf.find_kernels()
+            # TODO: what about targets that are not found automatically?
             targets = None
 
         # combine and sign kernels
-        self.signall(conf.kernels(targets))
+        self.do(conf.kernels(targets))
 
     # fully manual mode, all arguments specified
     def manual(self, args):
-        kernel = Kernel("manual", **(args.__dict__))
-        self.signall([kernel])
+        self.do([Kernel("manual", **(args.__dict__))])
 
     # helper to perform combine and sign
-    def signall(self, kernels):
-        for k in kernels:
-            k.do()
+    def do(self, Kernels):
+        for k in Kernels: k.do()
 
 
 # ---------- interactive ---------- #
