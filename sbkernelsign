@@ -10,11 +10,18 @@
 
 # minimum Python 3.8 required: f"" strings and := operators
 
-import sys, os, re, subprocess, logging, string, shutil, configparser as cfp
-from efistub import efistub_combine, parse_kernelversion
+import sys, os, re, subprocess, logging, string, shlex, datetime as dt
+import tempfile, struct, shutil, configparser as cfp
 
 # get a named logger
 logger = lambda s: logging.getLogger(s)
+
+# return a file descriptor number
+fd = lambda f: f.fileno()
+
+# get an iso format timestamp
+timestamp = lambda: dt.datetime.now(dt.timezone.utc).strftime("%FT%TZ")
+
 
 # configuration element from file and searching for kernels
 class Configuration(object):
@@ -134,29 +141,140 @@ class Kernel(object):
         return self
 
     # combine efistub, kernel and initrd into a single binary
-    def objcopy(self, hook=False):
+    def combisign(self, hook=False):
         stub = open(self.stub, 'rb')
         kernel = open(self.kernel, 'rb')
         initrd = [open(i, 'rb') for i in self.initrd]
-        output = open(self.output, 'wb')
-        # TODO: add name to osrel info for bootloader selections
-        efistub_combine(stub, kernel, initrd, self.cmdline, output, True, self.name)
-        return self
-
-    # create a signature on the combined binary
-    def sbsign(self):
-        cmd = ["sbsign", "--key", self.key, "--cert", self.cert, "--output", self.output, self.output]
-        subprocess.run(cmd, check=True)
+        output = open(self.output, 'w+b')
+        efistubcombine(stub, kernel, initrd, self.cmdline, output, self.name)
+        sbsign(output, self.key, self.cert)
+        [f.close() for f in [stub, kernel, *initrd, output]]
         return self
 
     # run all of the above
-    def combine(self):
-        return self.checkfiles().info().backup().objcopy().sbsign()
+    def doit(self):
+        return self.checkfiles().info().backup().combisign()
+
+
+# concatenate multiple open files in a spooled tempfile
+def concat(*files):
+    tmp = tempfile.SpooledTemporaryFile()
+    for file in files:
+        shutil.copyfileobj(file, tmp)
+        file.close()
+    tmp.seek(0)
+    return tmp
+
+# write bytes to a spooled tempfile
+def spool(data):
+    tmp = tempfile.SpooledTemporaryFile(mode="wb+")
+    tmp.write(data)
+    tmp.seek(0)
+    return tmp
+
+# parse os-release and return either PRETTY_NAME, NAME or 'Linux'
+def get_osname(osrel = "/etc/os-release"):
+    with open(osrel, "rt") as file:
+        osdict = {}
+        for line in file:
+            k, v = line.split("=", 1)
+            osdict[k] = shlex.split(v)[0]
+        return osdict.get("PRETTY_NAME", osdict.get("NAME", "Linux"))
+
+# generate a minimal os-release dynamically for embedding with efistub
+# https://github.com/systemd/systemd/blob/72830b187f5aa06b3e89ca121bbc35451764f1bc/docs/BOOT_LOADER_SPECIFICATION.md#type-2-efi-unified-kernel-images
+def osrelease(os, name, version):
+    tmp = tempfile.SpooledTemporaryFile(mode='wt+')
+    print(f"PRETTY_NAME={shlex.quote(os)}", file=tmp)
+    print(f"ID={shlex.quote(name)}", file=tmp)
+    print(f"VERSION_ID={shlex.quote(version)}", file=tmp)
+    tmp.seek(0)
+    return tmp
+
+# parse version from an open kernel file
+# https://github.com/file/file/blob/31a82018c2ed153b84ea5e115fa855de24eb46d1/magic/Magdir/linux#L109
+def parse_kernelversion(k):
+    # save position to restore later
+    s = k.tell()
+    # check 'magic' bytes
+    if not k.seek(514) or not k.read(4) == b"HdrS":
+        raise ValueError("%s is not a Linux kernel" % k.name)
+    # seek to version string via offset
+    k.seek(526)
+    offset = struct.unpack("<h", k.read(2))[0]
+    k.seek(offset + 512)
+    # read and split kernel version, restore seek
+    v = k.read(256).split(b" ", 1)[0].decode()
+    k.seek(s)
+    return v
+
+# combine efistub, kernel and initramfs in a single efi executable with objcopy
+def objcopy(efistub, kernel, initrd, cmdline, osrel, output):
+    # maybe concatenate initramfs in memory
+    if isinstance(initrd, list):
+        initrd = concat(*initrd)
+    # combine with objcopy subprocess
+    return subprocess.run([
+        "objcopy",
+        "--add-section", f".osrel=/dev/fd/{fd(osrel)}",
+        "--change-section-vma", ".osrel=0x0020000",
+        "--add-section", f".cmdline=/dev/fd/{fd(cmdline)}",
+        "--change-section-vma", ".cmdline=0x0030000",
+        "--add-section", f".linux=/dev/fd/{fd(kernel)}",
+        "--change-section-vma", ".linux=0x2000000",
+        "--add-section", f".initrd=/dev/fd/{fd(initrd)}",
+        "--change-section-vma", ".initrd=0x3000000",
+        f"/dev/fd/{fd(efistub)}",
+        f"/dev/fd/{fd(output)}"],
+        pass_fds=[fd(f) for f in [efistub, kernel, initrd, cmdline, osrel, output]],
+        check=True,
+    )
+
+# wrapper that generates osreal dynamically and combines kernel
+def efistubcombine(efistub, kernel, initrd, cmdline, output, name=None):
+    # spool cmdline in file
+    cmdline = spool(cmdline.encode("utf-8"))
+    # generate a spooled osrel file
+    osname = get_osname()
+    name = os.path.basename(kernel.name) if name is None else name
+    # TODO: parse_kernelversion either succeeds or raises ..
+    version = parse_kernelversion(kernel) or timestamp()
+    # TODO: add optional logging of osrel info
+    osrel = osrelease(osname, name, version)
+    # combine into output file
+    return objcopy(efistub, kernel, initrd, cmdline, osrel, output)
+
+# create a signature on a binary
+def sbsign(binary, key, cert):
+    return subprocess.run([
+        "sbsign", "--key", key, "--cert", cert,
+        "--output", f"/dev/fd/{fd(binary)}", f"/dev/fd/{fd(binary)}"],
+        pass_fds=[fd(binary)],
+        check=True,
+    )
+
+
+# ---------- commandlines ---------- #
+
+# standalone efistub-combine script without signing
+class EFIStubCmd(object):
+    def __init__(self):
+        from argparse import ArgumentParser, FileType
+        p = ArgumentParser()
+        p.add_argument("-e", dest="efistub", help="efi loader stub", type=FileType('rb'), default=Configuration.DEFAULTS["stub"])
+        p.add_argument("-k", dest="kernel", help="linux kernel", type=FileType('rb'), required=True)
+        p.add_argument("-i", dest="initrd", help="initramfs image", type=FileType('rb'), action='append', required=True)
+        p.add_argument("-c", dest="cmdline", help="kernel commandline", default="")
+        p.add_argument("-n", dest="name", help="embed name in osrel", default=None)
+        p.add_argument("-o", dest="output", help="output file", type=FileType('wb'), required=True)
+        args = p.parse_args()
+        proc = efistubcombine(**vars(args))
+        exit(proc.returncode)
 
 
 # parse the commandline and run the appropriate function
 # TODO: add 'sign' command to sign single extra binaries
-class Commandline(object):
+class SBKernelSignCmd(object):
     def __init__(self):
         from argparse import ArgumentParser, FileType
 
@@ -240,13 +358,17 @@ class Commandline(object):
     def signall(self, kernels):
         for k in kernels:
             try:
-                k.combine()
+                k.doit()
             except Exception as e:
                 k.log.error(e)
                 sys.exit(1)
 
 
-# ------- let's go -------
-if __name__ == "__main__":
-    Commandline()
+# ---------- interactive ---------- #
 
+if __name__ == "__main__":
+    # get the filename we're called by
+    called = os.path.basename(sys.argv[0])
+    # and run appropriate app
+    if called.startswith("efistub"): EFIStubCmd()
+    else: SBKernelSignCmd()
