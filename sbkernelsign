@@ -23,7 +23,9 @@ fd = lambda f: f.fileno()
 timestamp = lambda: dt.datetime.now(dt.timezone.utc).strftime("%FT%TZ")
 
 
-# configuration element from file and searching for kernels
+# ---------- configuration element ---------- #
+
+# load configuration from file and search for kernels
 class Configuration(object):
 
     # default configuration values
@@ -49,25 +51,25 @@ class Configuration(object):
     
     # initialize config parser with extended ${variable} interpolation
     def __init__(self, file):
+        self.log = logger("*")
+        self.log.debug(f"load confiuration from {file.name}")
         self.cfg = cfp.ConfigParser(interpolation=self.ExtendedSectionInterpolation())
         self.cfg.read_file(file)
-
         # write missing default values to DEFAULT section for interpolation
         for key in filter(lambda k: k not in self.cfg.defaults().keys(), self.DEFAULTS.keys()):
             self.cfg.set(self.cfg.default_section, key, self.DEFAULTS[key])
-
-        # assign boot and rexp on self because they're needed
+        # assign boot and rexp on self because they're needed later
         self.boot = self.cfg.get(self.cfg.default_section, "boot")
         self.rexp = self.cfg.get(self.cfg.default_section, "rexp")
 
     # add sections by globbing for kernels on filesystem
     def find_kernels(self):
-        logger("*").debug(f"find kernels in {self.boot} with /{self.rexp}/")
+        self.log.debug(f"find kernels in {self.boot} with /{self.rexp}/")
         kre = re.compile(self.rexp)
         for file in filter(lambda f: f.is_file(), os.scandir(self.boot)):
             if (match := kre.match(file.path)):
                 name = match.group(1)
-                logger("*").debug(f"kernel found: {name}")
+                self.log.debug(f" found kernel: {name}")
                 self.add_section(name)
 
     # ensure that a named kernel config section is present
@@ -80,30 +82,28 @@ class Configuration(object):
     def kernels(self, specific=None):
         sections = (self.cfg.sections() if specific is None else specific)
         if not len(sections):
-            logger("*").debug("empty kernels list")
+            self.log.debug("empty kernels list!")
             sys.exit(1)
-
         # generate the configurations
         for name in sections:
             section = self.add_section(name)
-
             # skip if explicitly ignored
             if section.getboolean("ignore", False):
                 logger(name).debug("ignored")
                 continue
-
             # transform initrd to list
             items = dict(section.items())
             items["initrd"] = items["initrd"].strip().splitlines()
-
             # yield a kernel configuration from interpolated values
             yield Kernel(name, **items)
 
 
+# ---------- kernel configuration ---------- #
+
 # a single kernel signing configuration and its processing steps
 class Kernel(object):
 
-    # many functions herein return self for dot-chaining
+    # functions herein return 'self' for dot-chaining
     def __init__(self, name, stub, kernel, initrd, cmdline, key, cert, output, **rest):
         self.name = name
         self.log = logger(name)
@@ -114,10 +114,13 @@ class Kernel(object):
         self.key = key
         self.cert = cert
         self.output = output
+        self.log.debug("processing configuration:")
+        for k in ("stub", "kernel", "initrd", "cmdline", "key", "cert", "output"):
+            self.log.debug(f" {k:<8}: {getattr(self, k)!r}")
 
     # check if all expected files are present and readable
     # TODO: special case for hooks with removed files
-    def checkfiles(self):
+    def check(self, hook=False):
         for file in [self.kernel, self.stub, *self.initrd, self.key, self.cert]:
             if not os.path.isfile(file):
                 raise FileNotFoundError(f"not a file: {file}")
@@ -125,35 +128,29 @@ class Kernel(object):
                 raise PermissionError(f"cannot read file: {file}")
         return self
 
-    # print info about this config
-    def info(self):
-        self.log.info("signing combined kernel")
-        for k in ("stub", "kernel", "initrd", "cmdline", "output"):
-            self.log.debug(f"{k:7s}: {getattr(self, k)}")
-        return self
-
-    # backup existing kernels with a suffix in place
+    # backup existing kernels in-place with a suffix
     def backup(self, suffix="~"):
         if os.path.isfile(self.output):
-            backup = self.output + suffix
+            backup = self.output + os.path.basename(suffix)
+            self.log.debug(f"backing up old kernel to {backup}")
             shutil.copy2(self.output, backup)
-            self.log.debug(f"backed up old kernel to {backup}")
         return self
-
-    # combine efistub, kernel and initrd into a single binary
-    def combisign(self, hook=False):
+    
+    # run this config: check, backup, combine, sign
+    def do(self, hook=False):
+        self.check(hook)
+        self.backup()
         stub = open(self.stub, 'rb')
         kernel = open(self.kernel, 'rb')
         initrd = [open(i, 'rb') for i in self.initrd]
         output = open(self.output, 'w+b')
-        efistubcombine(stub, kernel, initrd, self.cmdline, output, self.name)
+        efistubcombine(stub, kernel, initrd, self.cmdline, output, self.name, log=self.log)
         sbsign(output, self.key, self.cert)
         [f.close() for f in [stub, kernel, *initrd, output]]
         return self
 
-    # run all of the above
-    def doit(self):
-        return self.checkfiles().info().backup().combisign()
+
+# -------- miscellaneous --------- #
 
 
 # concatenate multiple open files in a spooled tempfile
@@ -188,25 +185,44 @@ def osrelease(os, name, version):
     print(f"PRETTY_NAME={shlex.quote(os)}", file=tmp)
     print(f"ID={shlex.quote(name)}", file=tmp)
     print(f"VERSION_ID={shlex.quote(version)}", file=tmp)
+    print(f"BUILD_ID={shlex.quote(timestamp())}", file=tmp)
     tmp.seek(0)
     return tmp
 
 # parse version from an open kernel file
 # https://github.com/file/file/blob/31a82018c2ed153b84ea5e115fa855de24eb46d1/magic/Magdir/linux#L109
 def parse_kernelversion(k):
+    ver = "unknown"
     # save position to restore later
-    s = k.tell()
-    # check 'magic' bytes
-    if not k.seek(514) or not k.read(4) == b"HdrS":
-        raise ValueError("%s is not a Linux kernel" % k.name)
-    # seek to version string via offset
-    k.seek(526)
-    offset = struct.unpack("<h", k.read(2))[0]
-    k.seek(offset + 512)
-    # read and split kernel version, restore seek
-    v = k.read(256).split(b" ", 1)[0].decode()
-    k.seek(s)
-    return v
+    seek = k.tell()
+    try:
+        # check 'magic' bytes
+        if not k.seek(514) or not k.read(4) == b"HdrS":
+            raise ValueError("%s is not a Linux kernel" % k.name)
+        # seek to version string via offset
+        k.seek(526)
+        offset = struct.unpack("<h", k.read(2))[0]
+        k.seek(offset + 512)
+        # read and split kernel version, restore seek
+        ver = k.read(256).split(b" ", 1)[0].decode()
+    except: pass
+    finally:
+        k.seek(seek)
+        return ver
+
+# wrapper that generates osreal dynamically and combines kernel
+def efistubcombine(efistub, kernel, initrd, cmdline, output, name=None, log=None, **rest):
+    # spool cmdline in file
+    cmdline = spool(cmdline.encode("utf-8"))
+    # generate a spooled osrel file
+    osname = get_osname()
+    name = os.path.basename(kernel.name) if name is None else name
+    # TODO: parse_kernelversion either succeeds or raises ..
+    version = parse_kernelversion(kernel)
+    osrel = osrelease(osname, name, version)
+    if log: log.info(f"{osname} ({name}-{version})")
+    # combine into output file
+    return objcopy(efistub, kernel, initrd, cmdline, osrel, output)
 
 # combine efistub, kernel and initramfs in a single efi executable with objcopy
 def objcopy(efistub, kernel, initrd, cmdline, osrel, output):
@@ -229,20 +245,6 @@ def objcopy(efistub, kernel, initrd, cmdline, osrel, output):
         pass_fds=[fd(f) for f in [efistub, kernel, initrd, cmdline, osrel, output]],
         check=True,
     )
-
-# wrapper that generates osreal dynamically and combines kernel
-def efistubcombine(efistub, kernel, initrd, cmdline, output, name=None):
-    # spool cmdline in file
-    cmdline = spool(cmdline.encode("utf-8"))
-    # generate a spooled osrel file
-    osname = get_osname()
-    name = os.path.basename(kernel.name) if name is None else name
-    # TODO: parse_kernelversion either succeeds or raises ..
-    version = parse_kernelversion(kernel) or timestamp()
-    # TODO: add optional logging of osrel info
-    osrel = osrelease(osname, name, version)
-    # combine into output file
-    return objcopy(efistub, kernel, initrd, cmdline, osrel, output)
 
 # create a signature on a binary
 def sbsign(binary, key, cert):
@@ -267,8 +269,10 @@ class EFIStubCmd(object):
         p.add_argument("-c", dest="cmdline", help="kernel commandline", default="")
         p.add_argument("-n", dest="name", help="embed name in osrel", default=None)
         p.add_argument("-o", dest="output", help="output file", type=FileType('wb'), required=True)
+        p.add_argument("-v", dest="verbose", help="log parsed osrel info", action="store_true")
         args = p.parse_args()
-        proc = efistubcombine(**vars(args))
+        logging.basicConfig(format="%(message)s", level=(logging.DEBUG if args.verbose else logging.WARN))
+        proc = efistubcombine(**vars(args), log=logger("efistub"))
         exit(proc.returncode)
 
 
@@ -357,11 +361,7 @@ class SBKernelSignCmd(object):
     # helper to perform combine and sign
     def signall(self, kernels):
         for k in kernels:
-            try:
-                k.doit()
-            except Exception as e:
-                k.log.error(e)
-                sys.exit(1)
+            k.do()
 
 
 # ---------- interactive ---------- #
