@@ -62,6 +62,10 @@ class Configuration(object):
         self.boot = self.cfg.get(self.cfg.default_section, "boot")
         self.rexp = self.cfg.get(self.cfg.default_section, "rexp")
 
+    # get a value from configuration
+    def get(self, option, section=None):
+        return self.cfg.get(section or self.cfg.default_section, option)
+
     # add sections by globbing for kernels on filesystem
     def find_kernels(self):
         self.log.debug(f"find kernels in {self.boot} with /{self.rexp}/")
@@ -217,7 +221,6 @@ def efistubcombine(efistub, kernel, initrd, cmdline, output, name=None, log=None
     # generate a spooled osrel file
     osname = get_osname()
     name = os.path.basename(kernel.name) if name is None else name
-    # TODO: parse_kernelversion either succeeds or raises ..
     version = parse_kernelversion(kernel)
     osrel = osrelease(osname, name, version)
     if log: log.info(f"{osname} ({name}-{version})")
@@ -277,7 +280,6 @@ class EFIStubCmd(object):
 
 
 # parse the commandline and run the appropriate function
-# TODO: add 'sign' command to sign single extra binaries
 class SBKernelSignCmd(object):
     def __init__(self):
         from argparse import ArgumentParser, FileType
@@ -293,13 +295,22 @@ class SBKernelSignCmd(object):
         auto.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
         auto.set_defaults(**defaults, func=self.auto)
 
-        # --- hook mode ---
+        # --- package manager hook ---
         hook = commands.add_parser("hook", help="hook mode for pacman")
         hook.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
         hook.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
         hook.set_defaults(**defaults, func=self.hook)
 
-        # --- manual mode ---
+        # --- sign a binary ---
+        sign = commands.add_parser("sign", help="sign a single binary")
+        sign.add_argument("-c", dest="config", help="configuration file")
+        sign.add_argument("-K", dest="key", help="signing key")
+        sign.add_argument("-C", dest="cert", help="signing certificate")
+        sign.add_argument("binary", help="binary or kernel to be signed", type=FileType('r+b'))
+        sign.set_defaults(**defaults, func=self.sign)
+
+        # --- fully manual ---
+        # TODO: somehow use config file as fallback?
         manual = commands.add_parser("manual", help="manual, all args provided")
         manual.add_argument("-k", dest="kernel", help="kernel binary", required=True)
         manual.add_argument("-i", dest="initrd", help="initrd list", nargs="+", metavar="IMG", required=True)
@@ -352,6 +363,16 @@ class SBKernelSignCmd(object):
 
         # combine and sign kernels
         self.do(conf.kernels(targets))
+
+    # sign a single binary
+    def sign(self, args):
+        if not (args.key and args.cert):
+            with open(args.config) as file:
+                conf = Configuration(file)
+                if not args.key:  args.key  = conf.get("key")
+                if not args.cert: args.cert = conf.get("cert")
+        args.binary.seek(0, 2)
+        return sbsign(args.binary, args.key, args.cert)
 
     # fully manual mode, all arguments specified
     def manual(self, args):
