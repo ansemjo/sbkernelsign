@@ -313,6 +313,7 @@ class SBKernelSignCmd(object):
         # --- automatic mode ---
         auto = commands.add_parser("auto", help="automatic, from configuration file")
         auto.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
+        auto.add_argument("section", help="only run specific sections from config", nargs="*")
         auto.set_defaults(**defaults, func=self.auto)
 
         # --- package manager hook ---
@@ -355,7 +356,7 @@ class SBKernelSignCmd(object):
     def auto(self, args):
         conf = Configuration(args.config)
         conf.find_kernels()
-        self.do(conf.kernels())
+        self.do(conf.kernels(args.section if len(args.section) else None))
 
     # hook mode for package managers: parse changed targets from stdin
     def hook(self, args):
