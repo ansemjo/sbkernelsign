@@ -109,6 +109,7 @@ class Kernel(object):
         self.log = logger(name)
         self.stub = stub
         self.kernel = kernel
+        # TODO: automatically find microcode?
         self.initrd = initrd
         self.cmdline = cmdline
         self.key = key
@@ -119,8 +120,7 @@ class Kernel(object):
             self.log.debug(f" {k:<8}: {getattr(self, k)!r}")
 
     # check if all expected files are present and readable
-    # TODO: special case for hooks with removed files
-    def check(self, hook=False):
+    def check(self):
         for file in [self.kernel, self.stub, *self.initrd, self.key, self.cert]:
             if not os.path.isfile(file):
                 raise FileNotFoundError(f"not a file: {file}")
@@ -135,10 +135,20 @@ class Kernel(object):
             self.log.debug(f"backing up old kernel to {backup}")
             shutil.copy2(self.output, backup)
         return self
+
+    # delete images for removed kernels
+    def remove(self):
+        self.backup()
+        f = self.output
+        self.log.warning(f"removing signed image")
+        if not os.path.isfile(f):
+            self.log.error(f"file is gone already: {f}")
+        else:
+            os.unlink(f)
     
     # run this config: check, backup, combine, sign
-    def do(self, hook=False):
-        self.check(hook)
+    def do(self):
+        self.check()
         self.backup()
         stub = open(self.stub, 'rb')
         kernel = open(self.kernel, 'rb')
@@ -306,6 +316,7 @@ class SBKernelSignCmd(object):
         hook = commands.add_parser("hook", help="hook mode for pacman")
         hook.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
         hook.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
+        hook.add_argument("-r", dest="remove", help="hooked kernel was remove", action="store_true")
         hook.set_defaults(**defaults, func=self.hook)
 
         # --- sign a binary ---
@@ -360,13 +371,18 @@ class SBKernelSignCmd(object):
                 # if any is not a kernel, force full resign
                 full = True
                 continue
+        
+        # handle removed kernels and return early
+        if args.remove:
+            if full: raise Exception("conflict! removal hook called on non-kernel paths")
+            for k in conf.kernels(targets): k.remove()
+            return
 
         # full auto rebuild if any target did not match kernel regexp
         if full:
             logger("*").info("forced complete resign")
             if not args.no_glob: conf.find_kernels()
-            # TODO: what about targets that are not found automatically?
-            targets = None
+            targets += conf.cfg.sections()
 
         # combine and sign kernels
         self.do(conf.kernels(targets))
