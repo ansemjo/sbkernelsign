@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # minimum version: 3.5
 
+# This is a Python reimplementation of its sibling efistub.sh. It was moved
+# away when the code was merged into the main script. It is now accessible
+# by linking the sbkernelsign script under any name starting with efistub:
+#   ln -s sbkernelsign efistub-combine
+#   ./efistub-combine --help
+
 import struct as __struct
 import shutil as __shutil
 import subprocess as __subprocess
