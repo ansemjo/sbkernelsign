@@ -47,7 +47,7 @@ class Configuration(object):
     
     # initialize config parser with extended ${variable} interpolation
     def __init__(self, file):
-        self.log = logger("*")
+        self.log = logger("conf")
         self.log.debug(f"load confiuration from {file.name}")
         self.cfg = cfp.ConfigParser(interpolation=self.ExtendedSectionInterpolation())
         self.cfg.read_file(file)
@@ -358,14 +358,28 @@ class SBKernelSignCmd(object):
     # hook mode for package managers: parse changed targets from stdin
     def hook(self, args):
         conf = Configuration(args.config)
+        log = logger("hook")
         targets, full = [], False
+        # match against kernel regexp
         kre = re.compile(conf.rexp)
-        
+        # special-case for arch linux hooks
+        libmod = re.compile(r"^usr/lib/modules/[a-z0-9._-]+/vmlinuz")
         # check lines
         for line in (line.strip() for _, line in enumerate(sys.stdin)):
-            if (match := kre.match(line)):
+            if libmod.match(line):
+                try:
+                    pkgbase = os.path.join("/", os.path.dirname(line), "pkgbase")
+                    with open(pkgbase) as file:
+                        name = file.readline().strip()
+                        log.info(f"matched: {name}")
+                        targets.append(name)
+                except:
+                    log.warning(f"failed reading name from pkgbase for {line}")
+                    full = True
+            elif (match := kre.match(line)):
                 # add all kernel rexp matches to a list
                 name = match.group(1)
+                log.info(f"matched: {name}")
                 targets.append(name)
             else:
                 # if any is not a kernel, force full resign
@@ -380,7 +394,7 @@ class SBKernelSignCmd(object):
 
         # full auto rebuild if any target did not match kernel regexp
         if full:
-            logger("*").info("forced complete resign")
+            log.info("forced complete resign")
             if not args.no_glob: conf.find_kernels()
             targets += conf.cfg.sections()
 
