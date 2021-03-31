@@ -1,5 +1,14 @@
+# testing
 pki/
 esp/
 test.cfg
+
+# dev clutter
 **/__pycache__
 .vscode/
+
+# packaging
+pkgbuild/
+pkg/
+src/
+*.pkg.tar.*
