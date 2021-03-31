@@ -19,10 +19,6 @@ logger = lambda s: logging.getLogger(s)
 # return a file descriptor number
 fd = lambda f: f.fileno()
 
-# get an iso format timestamp
-timestamp = lambda: dt.datetime.now(dt.timezone.utc).strftime("%FT%TZ")
-
-
 # ---------- configuration element ---------- #
 
 # load configuration from file and search for kernels
@@ -179,17 +175,28 @@ def get_osname(osrel = "/etc/os-release"):
         osdict = {}
         for line in file:
             k, v = line.split("=", 1)
-            osdict[k] = shlex.split(v)[0]
+            # read token with shlex and remove escapes
+            token = shlex.shlex(v, posix=True).get_token()
+            osdict[k] = token.replace("\\$", "$").replace("\\`", "`").replace("\\\"", "\"").replace("\\\\", "\\")
         return osdict.get("PRETTY_NAME", osdict.get("NAME", "Linux"))
 
 # generate a minimal os-release dynamically for embedding with efistub
 # https://github.com/systemd/systemd/blob/72830b187f5aa06b3e89ca121bbc35451764f1bc/docs/BOOT_LOADER_SPECIFICATION.md#type-2-efi-unified-kernel-images
+# https://man7.org/linux/man-pages/man5/os-release.5.html
 def osrelease(os, name, version):
+    # make a string safe for *_ID fields
+    idsub = lambda s: re.sub(r"[^a-z0-9._-]", "", s.lower())
+    # make a string safe for *_NAME fields
+    trans = { "$": "\\$", "\"": "\\\"", "\\": "\\\\", "`": "\\`" }
+    namsub = lambda s: "\"" + "".join((trans.get(c, c) for c in s)) + "\""
+    # spool in a temporary file
     tmp = tempfile.SpooledTemporaryFile(mode='wt+')
-    print(f"PRETTY_NAME={shlex.quote(os)}", file=tmp)
-    print(f"ID={shlex.quote(name)}", file=tmp)
-    print(f"VERSION_ID={shlex.quote(version)}", file=tmp)
-    print(f"BUILD_ID={shlex.quote(timestamp())}", file=tmp)
+    print(f"PRETTY_NAME={namsub(os)}", file=tmp)
+    print(f"ID={idsub(name)}", file=tmp)
+    print(f"VERSION_ID={idsub(version)}", file=tmp)
+    # include a timestamp as build id, just in case the above is not unique
+    build = dt.datetime.now(dt.timezone.utc).strftime("%FT%H%M%SZ")
+    print(f"BUILD_ID={build}", file=tmp)
     tmp.seek(0)
     return tmp
 
