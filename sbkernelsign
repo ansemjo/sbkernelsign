@@ -26,6 +26,7 @@ class Configuration(object):
 
     # default configuration values
     DEFAULTS = {
+        "name"    : "${section}",
         "boot"    : "/boot",
         "esp"     : "${boot}/efi",
         "output"  : "${esp}/EFI/Linux/${section}.efi",
@@ -34,8 +35,8 @@ class Configuration(object):
         "pki"     : "/etc/efikeys",
         "key"     : "${pki}/DatabaseKey.key",
         "cert"    : "${pki}/DatabaseKey.crt",
-        "kernel"  : "${boot}/vmlinuz-${section}",
-        "initrd"  : "${boot}/initramfs-${section}.img",
+        "kernel"  : "${boot}/vmlinuz-${name}",
+        "initrd"  : "${boot}/initramfs-${name}.img",
         "cmdline" : "quiet",
     }
 
@@ -80,13 +81,16 @@ class Configuration(object):
 
     # return a generator of Kernel objects for processing
     def kernels(self, specific=None):
-        sections = (self.cfg.sections() if specific is None else specific)
-        if not len(sections):
+        names = (self.cfg.sections() if specific is None else specific)
+        if not len(names):
             self.log.debug("empty kernels list!")
             sys.exit(1)
+        # add all sections once for interpolation
+        for name in names:
+            self.add_section(name)
         # generate the configurations
-        for name in sections:
-            section = self.add_section(name)
+        for name in names:
+            section = self.cfg[name]
             # skip if explicitly ignored
             if section.getboolean("ignore", False):
                 logger(name).debug("ignored")
@@ -95,7 +99,7 @@ class Configuration(object):
             items = dict(section.items())
             items["initrd"] = items["initrd"].strip().splitlines()
             # yield a kernel configuration from interpolated values
-            yield Kernel(name, **items)
+            yield Kernel(**items)
 
 
 # ---------- kernel configuration ---------- #
@@ -104,9 +108,9 @@ class Configuration(object):
 class Kernel(object):
 
     # functions herein return 'self' for dot-chaining
-    def __init__(self, name, stub, kernel, initrd, cmdline, key, cert, output, **rest):
-        self.name = name
-        self.log = logger(name)
+    def __init__(self, section, stub, kernel, initrd, cmdline, key, cert, output, **rest):
+        self.name = section
+        self.log = logger(section)
         self.stub = stub
         self.kernel = kernel
         # TODO: automatically find microcode?
@@ -304,19 +308,17 @@ class SBKernelSignCmd(object):
         parser = ArgumentParser(description="Bundle and sign kernels for secureboot systems.")
         parser.add_argument("-v", "--verbose", help="increase logging verbosity", action="count", default=2)
         commands = parser.add_subparsers(required=True, metavar="command", help="for help use: <command> --help")
-        defaults = dict(config="/etc/sbkernelsign.cfg", no_glob=False)
+        defaults = dict(config="/etc/sbkernelsign.cfg")
 
         # --- automatic mode ---
         auto = commands.add_parser("auto", help="automatic, from configuration file")
         auto.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
-        auto.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
         auto.set_defaults(**defaults, func=self.auto)
 
         # --- package manager hook ---
         hook = commands.add_parser("hook", help="hook mode for pacman")
         hook.add_argument("-c", dest="config", help="configuration file", type=FileType("r"))
-        hook.add_argument("--no-glob", help="do not automatically add kernels", action="store_true")
-        hook.add_argument("-r", dest="remove", help="hooked kernel was remove", action="store_true")
+        hook.add_argument("-r", dest="remove", help="run kernel removal hook", action="store_true")
         hook.set_defaults(**defaults, func=self.hook)
 
         # --- sign a binary ---
@@ -352,12 +354,13 @@ class SBKernelSignCmd(object):
     # automatic mode: search for kernels and combine all
     def auto(self, args):
         conf = Configuration(args.config)
-        if not args.no_glob: conf.find_kernels()
+        conf.find_kernels()
         self.do(conf.kernels())
 
     # hook mode for package managers: parse changed targets from stdin
     def hook(self, args):
         conf = Configuration(args.config)
+        conf.find_kernels()
         log = logger("hook")
         targets, full = [], False
         # match against kernel regexp
@@ -395,7 +398,6 @@ class SBKernelSignCmd(object):
         # full auto rebuild if any target did not match kernel regexp
         if full:
             log.info("forced complete resign")
-            if not args.no_glob: conf.find_kernels()
             targets += conf.cfg.sections()
 
         # combine and sign kernels
