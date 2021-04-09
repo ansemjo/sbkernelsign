@@ -81,7 +81,7 @@ class Configuration(object):
 
     # return a generator of Kernel objects for processing
     def kernels(self, specific=None):
-        names = (self.cfg.sections() if specific is None else specific)
+        names = (self.cfg.sections() if specific is None else set(specific))
         if not len(names):
             self.log.debug("empty kernels list!")
             sys.exit(1)
