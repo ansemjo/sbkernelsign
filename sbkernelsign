@@ -80,14 +80,21 @@ class Configuration(object):
         return self.cfg[name]
 
     # return a generator of Kernel objects for processing
-    def kernels(self, specific=None):
-        names = (self.cfg.sections() if specific is None else set(specific))
+    def kernels(self, specific=None, hook=False):
+        names = set(self.cfg.sections() if specific is None else specific)
         if not len(names):
             self.log.debug("empty kernels list!")
             sys.exit(1)
         # add all sections once for interpolation
         for name in names:
             self.add_section(name)
+        # if running in hook mode also add all sections with the same kernels
+        if hook:
+            for kernel in [self.cfg.get(n, "kernel") for n in names]:
+                for section in [s for s in self.cfg.sections() if s not in names]:
+                    if self.cfg.get(section, "kernel") == kernel:
+                        self.log.debug(f"hooked due to same kernel: {section}")
+                        names.add(section)
         # generate the configurations
         for name in names:
             section = self.cfg[name]
@@ -380,6 +387,7 @@ class SBKernelSignCmd(object):
                 except:
                     log.warning(f"failed reading name from pkgbase for {line}")
                     full = True
+                    continue
             elif (match := kre.match(line)):
                 # add all kernel rexp matches to a list
                 name = match.group(1)
@@ -402,7 +410,7 @@ class SBKernelSignCmd(object):
             targets += conf.cfg.sections()
 
         # combine and sign kernels
-        self.do(conf.kernels(targets))
+        self.do(conf.kernels(targets, hook=True))
 
     # sign a single binary
     def sign(self, args):
